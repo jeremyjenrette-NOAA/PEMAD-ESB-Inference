@@ -1,0 +1,37 @@
+# PLACEHOLDER TEMPLATE -- field names below (especially `classifier_weights`
+# and everything under `classifier_payload`) are NOT confirmed against a real
+# cascade container's model.py. They're a starting convention matching how
+# `examples/cascade_model_template.py` reads its `config` dict
+# (`config.get("detector_weights"/"classifier_weights", ...)`), so this file
+# exists as something to point `pemad-infer trigger --yaml-config` /
+# `--extra-weights` at while building the real container -- rename fields
+# here (and in the container's model.py) together once the real contract is
+# settled. See docs/two-stage-cascade.md.
+model_family: ultralytics # cascades register as an Ultralytics-shaped model_type (command=["python"]) -- see docs/two-stage-cascade.md
+
+# Stage 1 (detector) weights. Staged/rewritten by `--weights-file` exactly
+# like any single-model Ultralytics config.
+weights: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/2426crabdata_yolo12n_gcp_20260910_205126/weights/best.pt"
+
+# Stage 2 (classifier) weights. Staged/rewritten by
+# `--extra-weights classifier_weights=<local path to crabdata_tax.pt>`.
+classifier_weights: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/2426crabdata_yolo12n_gcp_20260910_205126/weights/crabdata_tax.pt"
+
+output_type: kwcoco
+upload_dataset_to_output_folder: no # option yes/no
+
+# Stage 1: detector inference params (mirrors configs/ultralytics/24star.yaml).
+payload:
+  conf: 0.01
+  iou: 0.1
+  nms_iou: 0.65
+  imgsz: 1024
+  device: cpu
+  batch: 4
+  max_det: 30
+
+# Stage 2: classifier params -- confirm real field names/values against
+# crabdata_tax.pt's actual training config before relying on these.
+classifier_payload:
+  input_size: 224
+  device: cpu

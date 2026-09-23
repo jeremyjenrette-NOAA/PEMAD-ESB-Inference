@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / credentials -- never commit these
+*.env
+.env.*
+credentials.json
+client_secret*.json
+*-key.json
+*.pem
+*.key
+
+# Model weights -- large binaries; stage to GCS instead (see config_builder.py)
+*.pt
+*.pth
+*.weights
+*.onnx

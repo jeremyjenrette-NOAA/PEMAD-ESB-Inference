@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pemad-esb-inference"
+version = "0.1.0"
+description = "CLI for triggering and monitoring NOAA Optics Cloud Batch / Airflow inference runs across workstations."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "google-cloud-storage>=2.10",
+    "google-cloud-batch>=0.17",
+    "google-cloud-logging>=3.5",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+pemad-infer = "pemad_esb_inference.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

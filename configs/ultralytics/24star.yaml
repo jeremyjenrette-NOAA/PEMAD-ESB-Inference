@@ -1,0 +1,12 @@
+model_family: ultralytics
+weights: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/24star_yolo12n_gcp_20260730_202404/weights/best.pt"
+
+output_type: kwcoco
+upload_dataset_to_output_folder: no # option yes/no
+payload:
+  conf: 0.01
+  iou: 0.1
+  imgsz: 1024
+  device: cpu
+  batch: 4
+  max_det: 30
