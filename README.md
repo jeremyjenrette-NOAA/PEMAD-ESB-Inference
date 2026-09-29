@@ -135,11 +135,13 @@ weights and wired into a top-level `<FIELD>:` line in the YAML, the same
 way `--weights-file` handles `weights:`:
 ```bash
 pemad-infer trigger \
-  --model cancer-crab-cascade \
+  --model ultralytics \
   --weights-file best.pt \
-  --extra-weights classifier_weights=crabdata_tax.pt \
-  --yaml-config configs/cancer-crab-cascade/template.yaml \
-  --run-name cancer_crab_cascade_20260917 \
+  --extra-weights classifier_weights=star_tax.pt \
+  --yaml-config configs/two_stage/template.yaml \
+  --run-name star_cascade_20260929 \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
+  --sample-rate 500 \
   --gcs-prefix jeremy \
   --dry-run
 ```
