@@ -13,7 +13,20 @@ REGION = os.environ.get("PEMAD_REGION", "us-central1")
 # Cloud Composer / Airflow
 COMPOSER_ENVIRONMENT = os.environ.get("PEMAD_COMPOSER_ENV", "composer-env1")
 COMPOSER_LOCATION = os.environ.get("PEMAD_COMPOSER_LOCATION", "us-central1")
-DAG_ID = os.environ.get("PEMAD_DAG_ID", "nmfs-optics-pipeline-longrunning-dag")
+# Renamed server-side at some point after 2026-09-21 -- "nmfs-optics-pipeline-longrunning-dag"
+# (used successfully many times before that date) started failing with
+# airflow.exceptions.DagNotFound, even though 'airflow dags list-import-errors'
+# came back empty -- i.e. not a broken DAG, it just has a new dag_id now.
+# 'gcloud composer environments run composer-env1 --location us-central1 dags list'
+# on 2026-09-29 showed the same pipeline file
+# (nmfs-optics-cloud-batch-longrunning-pipeline.py) now registered under dag_id
+# 'optics-pipeline'. NOTE: that same listing also showed an
+# 'optics-pipeline-OSI-170' entry (a differently-suffixed variant of the same
+# file) -- unconfirmed whether that's a WIP/ticket-scoped branch or something
+# that should eventually replace this default; worth reconfirming with the
+# platform team if trigger starts failing again. Override with PEMAD_DAG_ID
+# without a code change if this drifts again before it's updated here.
+DAG_ID = os.environ.get("PEMAD_DAG_ID", "optics-pipeline")
 
 # GCS
 # The DAG's `output_bucket` param is hard-coded server-side ("Fixed bucket
