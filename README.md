@@ -90,7 +90,7 @@ pemad-infer trigger \
 Check on a run without `--wait`:
 ```bash
 pemad-infer status                                               # recent runs
-pemad-infer status --logical-date "2026-09-22T21:20:08+00:00"    # task-by-task state for one run
+pemad-infer status --logical-date "2026-09-30T13:05:36+00:00"    # task-by-task state for one run
 ```
 
 ### Staging weights + auto-writing the config
@@ -110,12 +110,26 @@ pemad-infer trigger \
   --gcs-prefix jeremy \
   --dry-run
 ```
-This uploads the weights to
-`gs://<bucket>/<gcs-prefix>/weights/<run-name>/weights/<filename>`,
-rewrites (or inserts) the YAML's `weights:` field to point at that path,
-and uploads the resulting config to
-`gs://<bucket>/<gcs-prefix>/configs/<run-name>.yaml` -- before the DAG is
-ever triggered.
+By default this is **content-addressed / deduplicated**: the local file
+is hashed (sha256) and staged to
+`gs://<bucket>/<gcs-prefix>/weights/by-hash/<sha256>/<filename>` --
+a shared, run-independent path. If that exact byte-identical file was
+already staged by any prior run (same model retriggered, same
+`--weights-file`), the upload is **skipped** and the existing URI is
+reused, instead of copying the same multi-hundred-MB file into a fresh
+`<run-name>`-scoped path every single time. Which run used a given
+weights file is still recorded in that run's run card (see below), so
+nothing about provenance is lost by sharing the storage path across
+runs. Pass `--no-dedupe-weights` (on `trigger`, `stage-weights`, or
+`stage-config`) to restore the old behavior -- always upload to a
+fresh `gs://<bucket>/<gcs-prefix>/weights/<run-name>/weights/<filename>`
+path, even if identical content already exists elsewhere -- e.g. if
+you deliberately want one run's copy fully isolated while debugging a
+suspected bad upload.
+
+The rewritten YAML config is always uploaded fresh to
+`gs://<bucket>/<gcs-prefix>/configs/<run-name>.yaml` -- before the DAG
+is ever triggered.
 
 To stage weights and/or a config without triggering anything (e.g. to
 pre-stage a batch of runs), use the standalone subcommands:
@@ -165,6 +179,83 @@ must match whatever the container's `model.py` actually reads from its
 config -- see `docs/two-stage-cascade.md` for the full walkthrough,
 including building the cascade container itself.
 
+### Combined-image-contract models (e.g. `star-cascade`)
+
+Some containers (anything forked from `optics-models-ultralytics-detection`
+-- app.py + model.py + inference_runner.py all in one image, e.g. the real
+`star-cascade` model) use a different input contract than the
+YAML_CONFIG_PATH-plus-flat-instances-list wrapper the other model families
+use: `inference_runner.py` never reads `YAML_CONFIG_PATH` at all, and
+expects each manifest instance to be a dict with `input_files`/
+`output_file`/`config` keys rather than a bare `gs://` string. Confirmed
+2026-09-30 after a real `star-cascade` Cloud Batch job failed every
+instance with `'str' object has no attribute 'get'` using the older flat
+manifest shape. Pass `--combined-image-contract` on `trigger` (or
+`build-input`) for these models -- it builds the correct nested manifest
+shape instead, embedding the staged/rewritten YAML config inline:
+```bash
+pemad-infer trigger \
+  --model star-cascade \
+  --weights-file best.pt \
+  --extra-weights classifier_weights=star_tax.pt taxonomy_json=star_taxonomy.json \
+  --yaml-config configs/two_stage/template.yaml \
+  --combined-image-contract \
+  --run-name star-cascade_20260930 \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
+  --sample-rate 500 \
+  --gcs-prefix jeremy \
+  --wait
+```
+The output file this writes to is run-specific by default --
+`gs://<bucket>/<output-folder>/<run-name>/annotations.json` -- so
+consecutive runs against the same `--output-folder` no longer overwrite
+each other's output. That resolved path is also printed at the end of a
+`--wait` run and recorded on the run card.
+
+### Input staging (multi-folder inputs) and cleanup
+
+When a resolved image list (from `--survey-prefix`, `--habcam`, or
+`--images`) spans more than one GCS folder, `trigger` automatically
+copies every image into one flat, run-specific staging folder first
+(`gs://<bucket>/<gcs-prefix>/staging/<run-name>/`, a cheap server-side
+copy, no download/upload/egress cost) before submitting the job -- this
+sidesteps a known bug in the older chunking wrapper where a batch
+spanning multiple folders crashes with `FileNotFoundError` (see
+`docs/architecture.md`). Pass `--no-flatten-inputs` to skip this and
+submit the original (unstaged) paths.
+
+Nothing deletes these staging folders on its own, so they grow without
+bound as more runs are triggered. Two ways to manage that:
+
+1. **`pemad-infer stage-cleanup`** -- reports (dry run, the default) or
+   deletes (`--force`) staging run folders whose newest file is older
+   than `--older-than-days` (default 30). Recent folders are always left
+   alone, so staged candidate images from recent runs stay available for
+   comparing output across runs:
+   ```bash
+   pemad-infer stage-cleanup --gcs-prefix jeremy                       # dry run -- report only
+   pemad-infer stage-cleanup --gcs-prefix jeremy --older-than-days 14 --force  # actually delete
+   ```
+2. **A GCS Object Lifecycle rule** (recommended as the durable,
+   zero-maintenance fix -- set once by a bucket admin, needs no ongoing
+   CLI/cron involvement):
+   ```bash
+   gcloud storage buckets update gs://ggn-nmfs-osi-dev-1-data \
+     --lifecycle-file=/dev/stdin <<'EOF'
+   {
+     "rule": [
+       {
+         "action": {"type": "Delete"},
+         "condition": {"age": 30, "matchesPrefix": ["jeremy/staging/"]}
+       }
+     ]
+   }
+   EOF
+   ```
+   The two are complementary -- `stage-cleanup` is useful for an
+   on-demand check or a shorter/different retention window than the
+   bucket-wide rule.
+
 ### Run cards
 
 Every `trigger` (including under `--dry-run`) writes a **run card**: a
@@ -181,15 +272,16 @@ independent of Airflow's own post-hoc archived-config YAML. Skip it with
 - `src/pemad_esb_inference/` -- the package
   - `config.py` -- project/environment constants (env-var overridable)
   - `model_registry.py` -- reads the live `model_runtime_definitions.json`, resolves a model key, infers its family
-  - `input_builder.py` -- builds the Ultralytics/VIAME manifest JSON shapes
+  - `input_builder.py` -- builds the Ultralytics/VIAME flat/VIAME manifest shapes, plus the combined-image-contract manifest shape (`--combined-image-contract`, see above)
+  - `input_staging.py` -- flattens a multi-folder input list into one run-specific `staging/` GCS folder via server-side copy (see "Input staging" above)
   - `habcam_paths.py` -- resolves HabCam filenames to their expected GCS paths
   - `survey_sampler.py` -- samples 1-in-N images from a survey folder, stratified per leaf folder, excluding non-conforming leaf-folder names (e.g. `auv`) by default
-  - `config_builder.py` -- stages local weights + rewrites a local YAML template's `weights:` field automatically (and, via `--extra-weights`, any number of additional named weight fields for multi-weight/cascade models)
+  - `config_builder.py` -- stages local weights (content-addressed/deduplicated by default, see above) + rewrites a local YAML template's `weights:` field automatically (and, via `--extra-weights`, any number of additional named weight fields for multi-weight/cascade models)
   - `run_card.py` -- builds and uploads a pre-flight provenance "run card" for a trigger
-  - `gcs.py` -- small google-cloud-storage wrappers (upload/download/list)
+  - `gcs.py` -- small google-cloud-storage wrappers (upload/download/list/exists/delete)
   - `airflow_client.py` -- triggers/queries the DAG via `gcloud composer environments run`
   - `batch_monitor.py` -- resolves and polls the resulting Cloud Batch job
-  - `cli.py` -- the `pemad-infer` command
+  - `cli.py` -- the `pemad-infer` command (`models|build-input|trigger|status|stage-weights|stage-config|stage-cleanup`)
 - `configs/` -- known-good pipeline YAML configs, one per model/weight-set
 - `docs/` -- architecture notes, the permissions/troubleshooting model, the BYOM/Docker reference, and the two-stage cascade model guide
 - `examples/` -- copy-paste shell examples, plus a structural (untested) template for a cascade model's `model.py`
