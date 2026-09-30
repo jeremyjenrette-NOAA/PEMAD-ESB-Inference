@@ -92,6 +92,7 @@ def cmd_build_input(args: argparse.Namespace) -> None:
                 else Path(args.yaml_config).read_text(encoding="utf-8")
             )
             combined_config = yaml.safe_load(text) or {}
+        combined_config["stereo_side"] = args.stereo_side
         manifest = input_builder.combined_contract_manifest(
             image_paths, args.output_file, combined_config
         )
@@ -109,6 +110,13 @@ def cmd_trigger(args: argparse.Namespace) -> None:
     definition = resolve(args.model)
 
     run_name = args.run_name or f"{args.model}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    if args.stereo_side != "full" and not args.combined_image_contract:
+        sys.exit(
+            "--stereo-side left/right requires --combined-image-contract -- only that "
+            "model.py contract reads the stereo_side config key. Pass --stereo-side full "
+            "(the default) if this model doesn't need stereo splitting."
+        )
 
     survey_sample = None
     input_count = None
@@ -195,6 +203,7 @@ def cmd_trigger(args: argparse.Namespace) -> None:
 
     if args.combined_image_contract and resolved_image_paths is not None:
         combined_config = yaml.safe_load(yaml_config_text) or {}
+        combined_config["stereo_side"] = args.stereo_side
         # Run-specific filename (nested under run_name) instead of a fixed
         # "annotations.json" -- the old fixed name meant every run using the
         # same --output-folder silently overwrote the previous run's output.
@@ -246,6 +255,7 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             extra_weights=extra_weight_uris or None,
             staged_input=staged_input_info,
             output_file=output_file,
+            stereo_side=args.stereo_side if args.combined_image_contract else None,
         )
         card_uri = upload_run_card(card)
         print(f"Run card -> {card_uri}")
@@ -432,6 +442,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --combined-image-contract: gs:// URI or local path to a YAML file parsed and "
              "embedded as each instance's inline 'config' dict.",
     )
+    p_build.add_argument(
+        "--stereo-side", choices=["full", "left", "right"], default="full",
+        help="With --combined-image-contract: crop each image to one half of a spliced "
+             "left+right stereo frame before it's embedded in the manifest's config -- the "
+             "combined-image-contract model.py (e.g. star-cascade) reads this and splits "
+             "before running the detector, so a real organism visible in both eyes' overlap "
+             "zone isn't detected/classified twice. Default 'full' (no split, the original "
+             "behavior) for backward compatibility.",
+    )
     p_build.set_defaults(func=cmd_build_input)
 
     p_trigger = sub.add_parser("trigger", help="Trigger a DAG run")
@@ -527,6 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
              "after every instance in a real run failed with \"'str' object has no attribute "
              "'get'\" using the old flat manifest shape. See input_builder.py's module docstring "
              "for the full contract difference.",
+    )
+    p_trigger.add_argument(
+        "--stereo-side", choices=["full", "left", "right"], default="full",
+        help="Crop each image to one half of a spliced left+right stereo frame before the "
+             "combined-image-contract model.py splits it off to the detector -- fixes a real "
+             "organism visible in both eyes' overlap zone being detected/classified twice "
+             "(once per eye). Requires --combined-image-contract. Default 'full' (no split, "
+             "the original behavior) for backward compatibility. Confirmed 2026-09-30 as the "
+             "root fix for double-counted star-cascade detections on HabCam stereo frames.",
     )
     p_trigger.set_defaults(func=cmd_trigger)
 

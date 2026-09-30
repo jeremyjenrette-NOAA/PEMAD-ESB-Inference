@@ -39,6 +39,7 @@ class RunCard:
     output_folder: str
     gcs_prefix: str
     output_file: Optional[str] = None
+    stereo_side: Optional[str] = None
     survey_sample: Optional[Dict[str, Any]] = None
     extra_weights: Optional[Dict[str, str]] = None
     staged_input: Optional[Dict[str, Any]] = None
@@ -61,6 +62,7 @@ def build_run_card(
     extra_weights: Optional[Dict[str, str]] = None,
     staged_input: Optional[Dict[str, Any]] = None,
     output_file: Optional[str] = None,
+    stereo_side: Optional[str] = None,
 ) -> RunCard:
     model_def_dict = dataclasses.asdict(model_definition)
     model_def_dict["family"] = model_definition.family  # a property, not a dataclass field -- add explicitly
@@ -79,6 +81,7 @@ def build_run_card(
         extra_weights=extra_weights,
         staged_input=staged_input,
         output_file=output_file,
+        stereo_side=stereo_side,
     )
 
 
