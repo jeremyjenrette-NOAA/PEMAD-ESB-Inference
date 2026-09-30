@@ -147,32 +147,6 @@ repeatable `--extra-weights FIELD=PATH` alongside `--weights-file` on
 `trigger` or `stage-config`. Each extra file is staged next to the primary
 weights and wired into a top-level `<FIELD>:` line in the YAML, the same
 way `--weights-file` handles `weights:`:
-```bash
-pemad-infer trigger \
-  --model ultralytics \
-  --weights-file best.pt \
-  --extra-weights classifier_weights=star_tax.pt \
-  --yaml-config configs/two_stage/template.yaml \
-  --run-name star_cascade_20260929 \
-  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
-  --sample-rate 500 \
-  --gcs-prefix jeremy \
-  --dry-run
-```
-
-local
-```bash
-PEMAD_DAG_ID=optics-pipeline pemad-infer trigger \
-  --model ultralytics \
-  --weights-file models/24star_yolo12n_gcp_20260909_174845/weights/best.pt \
-  --extra-weights classifier_weights=models/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt \
-  --yaml-config configs/two_stage/template.yaml \
-  --run-name star_cascade_20260929b \
-  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
-  --sample-rate 500 \
-  --gcs-prefix jeremy \
-  --dry-run
-```
 
 (also available as `examples/trigger_cancer_crab_cascade.sh`). `FIELD`
 must match whatever the container's `model.py` actually reads from its
@@ -196,13 +170,14 @@ shape instead, embedding the staged/rewritten YAML config inline:
 ```bash
 pemad-infer trigger \
   --model star-cascade \
-  --weights-file best.pt \
-  --extra-weights classifier_weights=star_tax.pt taxonomy_json=star_taxonomy.json \
+  --weights-file models/24star_yolo12n_gcp_20260909_174845/weights/best.pt \
+  --extra-weights classifier_weights=models/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt \
+  --extra-weights models/24star_yolo12n_gcp_20260909_174845/weights/taxonomy_json=star_taxonomy.json \
   --yaml-config configs/two_stage/template.yaml \
   --combined-image-contract \
   --run-name star-cascade_20260930 \
-  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
-  --sample-rate 500 \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2022/" \
+  --sample-rate 50 \
   --gcs-prefix jeremy \
   --wait
 ```
