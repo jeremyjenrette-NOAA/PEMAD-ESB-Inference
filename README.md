@@ -172,12 +172,12 @@ pemad-infer trigger \
   --model star-cascade \
   --weights-file models/24star_yolo12n_gcp_20260909_174845/weights/best.pt \
   --extra-weights classifier_weights=models/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt \
-  --extra-weights models/24star_yolo12n_gcp_20260909_174845/weights/taxonomy_json=star_taxonomy.json \
+  --extra-weights taxonomy_json=models/24star_yolo12n_gcp_20260909_174845/weights/star_taxonomy.json \
   --yaml-config configs/two_stage/template.yaml \
   --combined-image-contract \
   --run-name star-cascade_20260930 \
-  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2022/" \
-  --sample-rate 50 \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
+  --sample-rate 5 \
   --gcs-prefix jeremy \
   --wait
 ```
