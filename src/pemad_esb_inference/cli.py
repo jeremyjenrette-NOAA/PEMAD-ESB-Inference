@@ -411,6 +411,35 @@ def cmd_export_viewer_assets(args: argparse.Namespace) -> None:
         print(f"Zipped: {result['zip_path']} -- upload this to get the assets off this machine.")
 
 
+
+def cmd_ingest_run(args: argparse.Namespace) -> None:
+    """Load a completed export-viewer-assets export into Postgres for
+    the results-auditor app. See db_ingest.py's module docstring and
+    db/schema.sql."""
+    import json
+    from pathlib import Path as _Path
+    from .db_ingest import build_rows, load_into_postgres, upload_assets
+
+    assets_dir = _Path(args.assets_dir)
+    manifest = json.loads((assets_dir / "manifest.json").read_text())
+
+    if not args.skip_upload and not args.gcs_asset_prefix:
+        sys.exit("ingest-run: --gcs-asset-prefix is required unless --skip-upload is set")
+
+    asset_uri_prefix = None
+    if not args.skip_upload:
+        asset_uri_prefix = upload_assets(str(assets_dir), args.gcs_asset_prefix)
+    else:
+        print("[ingest-run] --skip-upload set: storing local relative thumb paths, not gs:// URIs.")
+
+    rows = build_rows(manifest, asset_uri_prefix)
+    run_id = load_into_postgres(rows, args.db_dsn)
+    print(
+        f"[ingest-run] Loaded run {run_id}: {len(rows['images'])} image(s), "
+        f"{len(rows['detections'])} detection(s)."
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     if args.logical_date:
         print(task_states_for_run(args.logical_date))
@@ -680,6 +709,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip zipping output-dir into a single archive (zipped by default, for easy upload)",
     )
     p_export_viewer.set_defaults(func=cmd_export_viewer_assets)
+
+    p_ingest_run = sub.add_parser(
+        "ingest-run",
+        help="Load a completed export-viewer-assets export into Postgres for the results-auditor app",
+    )
+    p_ingest_run.add_argument(
+        "--assets-dir", required=True,
+        help="The --output-dir from a prior export-viewer-assets run (contains manifest.json, context/, crops/)",
+    )
+    p_ingest_run.add_argument(
+        "--db-dsn", required=True,
+        help="Postgres connection string, e.g. postgresql://user:pass@localhost:5432/viewer_dev",
+    )
+    p_ingest_run.add_argument(
+        "--gcs-asset-prefix", default=None,
+        help="GCS folder prefix to upload context/crops thumbnails to (e.g. jeremy/viewer_assets/<run-name>); "
+             "required unless --skip-upload is set",
+    )
+    p_ingest_run.add_argument(
+        "--skip-upload", action="store_true",
+        help="Don't upload thumbnails to GCS -- store the export's local relative paths in the DB instead. "
+             "Only useful for inspecting the schema/ingestion locally before wiring up real asset hosting.",
+    )
+    p_ingest_run.set_defaults(func=cmd_ingest_run)
 
     p_status = sub.add_parser("status", help="Check DAG run / task status")
     p_status.add_argument(

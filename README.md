@@ -318,6 +318,47 @@ An image whose filename has no match in the run's input manifest (would
 only happen if the manifest and annotations.json somehow disagree) is
 skipped and reported, rather than failing the whole export.
 
+### Loading a run into Postgres (results-auditor app)
+
+`ingest-run` loads a completed `export-viewer-assets` export into
+Postgres -- schema in `db/schema.sql` -- so a real backend can
+query/filter/paginate detections server-side (instead of every viewer
+re-reading one flat `manifest.json`), and so a reviewer's decision has
+somewhere to live. Requires the `db` extra: `pip install -e ".[db]"`.
+
+Start a local Postgres to iterate against (schema is still evolving --
+see the architecture notes for where this is headed: Cloud SQL +
+Cloud Run once the schema and ingestion flow are proven out):
+
+```bash
+docker run -d --name viewer-db -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=viewer_dev \
+  postgres:16
+
+psql "postgresql://postgres:postgres@localhost:5432/viewer_dev" -f db/schema.sql
+```
+
+Then, after `export-viewer-assets` has written `manifest.json` +
+`context/` + `crops/` to some `--output-dir`:
+
+```bash
+pemad-infer ingest-run \
+  --assets-dir ./viewer_assets \
+  --gcs-asset-prefix jeremy/viewer_assets/star-cascade_20260930_left_v2 \
+  --db-dsn postgresql://postgres:postgres@localhost:5432/viewer_dev
+```
+
+This uploads `context/`/`crops/` to
+`gs://<bucket>/<gcs-asset-prefix>/...` (so the eventual hosted app can
+serve them without depending on whatever machine ran the export) and
+loads `runs`/`images`/`detections` rows, wiring up foreign keys from
+the manifest's own image/annotation ids. Pass `--skip-upload` to load
+rows with the export's local relative thumb paths instead, for
+inspecting the schema/ingestion locally before GCS hosting is wired up.
+
+`runs.run_card_uri` is `UNIQUE` -- `ingest-run` is meant to be run once
+per export, not repeatedly on the same run.
+
 ## Layout
 
 - `src/pemad_esb_inference/` -- the package
@@ -330,14 +371,16 @@ skipped and reported, rather than failing the whole export.
   - `config_builder.py` -- stages local weights (content-addressed/deduplicated by default, see above) + rewrites a local YAML template's `weights:` field automatically (and, via `--extra-weights`, any number of additional named weight fields for multi-weight/cascade models)
   - `run_card.py` -- builds and uploads a pre-flight provenance "run card" for a trigger
   - `viewer_export.py` -- re-derives per-detection crop thumbnails + a `manifest.json` from a completed run's run card (see "Results viewer assets" above)
+  - `db_ingest.py` -- loads a `viewer_export.py` export into Postgres for the results-auditor app (see "Loading a run into Postgres" above, and `db/schema.sql`)
   - `gcs.py` -- small google-cloud-storage wrappers (upload/download text+bytes/list/exists/delete)
   - `airflow_client.py` -- triggers/queries the DAG via `gcloud composer environments run`
   - `batch_monitor.py` -- resolves and polls the resulting Cloud Batch job
-  - `cli.py` -- the `pemad-infer` command (`models|build-input|trigger|status|stage-weights|stage-config|stage-cleanup|export-viewer-assets`)
+  - `cli.py` -- the `pemad-infer` command (`models|build-input|trigger|status|stage-weights|stage-config|stage-cleanup|export-viewer-assets|ingest-run`)
 - `configs/` -- known-good pipeline YAML configs, one per model/weight-set
 - `docs/` -- architecture notes, the permissions/troubleshooting model, the BYOM/Docker reference, and the two-stage cascade model guide
 - `examples/` -- copy-paste shell examples, plus a structural (untested) template for a cascade model's `model.py`
 - `tests/` -- unit tests for the pure-Python pieces (manifest building, HabCam path resolution, config rewriting, run cards) -- no GCP credentials required to run these
+- `db/schema.sql` -- the Postgres schema `ingest-run` loads into (see "Loading a run into Postgres" above)
 
 ## Known limitations / next steps
 

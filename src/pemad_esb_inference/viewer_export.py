@@ -203,6 +203,7 @@ def export(
             {
                 "id": image_id,
                 "file_name": file_name,
+                "source_uri": source_uri,
                 "width": crop_width,
                 "height": crop_height,
                 "stereo_side": image_entry.get("stereo_side"),
@@ -216,6 +217,10 @@ def export(
         "run_card": run_card_uri,
         "model_type": run_card.get("model_type"),
         "created_at": run_card.get("created_at"),
+        "stereo_side": run_card.get("stereo_side"),
+        "input_file": input_file,
+        "output_file": output_file,
+        "yaml_config_snapshot": run_card.get("yaml_config_snapshot"),
         "categories": [{"id": cid, "name": name} for cid, name in category_names.items()],
         "images": manifest_images,
         "annotations": manifest_annotations,
