@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import List, Tuple, Union
 
 from google.cloud import storage
@@ -84,3 +85,42 @@ def list_prefix_with_sizes(gs_uri_prefix: str) -> List[Tuple[str, int]]:
 
 def list_prefix(gs_uri_prefix: str) -> List[str]:
     return [path for path, _size in list_prefix_with_sizes(gs_uri_prefix)]
+
+
+def blob_exists(gs_uri: str) -> bool:
+    """True if an object already exists at this exact gs:// URI. Used
+    by the content-addressed weights staging in config_builder.py to
+    skip re-uploading a file whose hash-addressed path is already
+    present.
+    """
+    bucket_name, blob_path = _split_uri(gs_uri)
+    blob = _get_client().bucket(bucket_name).blob(blob_path)
+    return blob.exists()
+
+
+def list_prefix_with_metadata(gs_uri_prefix: str) -> List[Tuple[str, int, datetime]]:
+    """Like `list_prefix_with_sizes`, but also returns each object's
+    creation time (UTC, tz-aware). Used by `stage-cleanup` to find
+    staging run folders old enough to be safe to delete.
+    """
+    bucket_name, blob_path = _split_uri(gs_uri_prefix)
+    blobs = _get_client().list_blobs(bucket_name, prefix=blob_path)
+    return [
+        (f"gs://{bucket_name}/{b.name}", b.size or 0, b.time_created)
+        for b in blobs
+    ]
+
+
+def delete_prefix(gs_uri_prefix: str) -> int:
+    """Delete every object under this gs://.../ prefix. Returns the
+    count deleted. Used for staging-area cleanup (`stage-cleanup`) --
+    callers are expected to confirm the prefix is scoped narrowly
+    enough (e.g. one staging run folder) to be safe to wipe before
+    calling.
+    """
+    bucket_name, blob_path = _split_uri(gs_uri_prefix)
+    bucket = _get_client().bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=blob_path))
+    for blob in blobs:
+        blob.delete()
+    return len(blobs)

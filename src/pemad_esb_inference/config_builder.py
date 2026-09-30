@@ -27,6 +27,7 @@ with whatever name you pass it.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -72,20 +73,59 @@ def rewrite_weights_field(yaml_text: str, new_weights_uri: str) -> str:
     return rewrite_yaml_field(yaml_text, "weights", new_weights_uri)
 
 
+def _sha256_of_file(local_path: str, chunk_size: int = 1 << 20) -> str:
+    """Stream a local file through sha256 in fixed-size chunks (never
+    loads the whole file into memory -- weights files can be large).
+    """
+    digest = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def stage_weights(
     local_weights_path: str,
     run_name: str,
     gcs_prefix: str,
     bucket: str = config.OUTPUT_BUCKET,
     weights_filename: Optional[str] = None,
+    dedupe: bool = True,
 ) -> str:
-    """Upload a local weights file to the standard layout:
+    """Upload a local weights file to GCS.
+
+    dedupe=True (default): content-addressed. The file is hashed
+    (sha256) and staged once to a shared, run-independent path:
+    gs://<bucket>/<gcs_prefix>/weights/by-hash/<sha256>/<filename>
+    If a blob already exists at that exact path -- i.e. this same
+    model_type has already been triggered at least once with this
+    exact (byte-identical) weights file -- the upload is skipped
+    entirely and the existing URI is returned. Triggering the same
+    model repeatedly no longer creates a fresh multi-hundred-MB copy
+    of the same weights on every run. Provenance (which run used
+    this file) still lives in that run's run card (run_card.py), not
+    in the storage path, so nothing is lost by sharing the path
+    across runs.
+
+    dedupe=False: the older behavior -- always uploads to a fresh,
+    run-scoped path:
     gs://<bucket>/<gcs_prefix>/weights/<run_name>/weights/<filename>
-    (matches the convention already used by configs/ultralytics/24star.yaml).
+    even if byte-identical content already exists elsewhere. Kept as
+    an escape hatch (e.g. deliberately isolating one run's copy while
+    debugging a suspected bad upload) via `--no-dedupe-weights`.
     """
     from . import gcs  # deferred: keeps this module importable without google-cloud-storage
 
     filename = weights_filename or Path(local_weights_path).name
+
+    if dedupe:
+        file_hash = _sha256_of_file(local_weights_path)
+        dest = f"gs://{bucket}/{gcs_prefix}/weights/by-hash/{file_hash}/{filename}"
+        if gcs.blob_exists(dest):
+            return dest
+        gcs.upload_file(local_weights_path, dest)
+        return dest
+
     dest = f"gs://{bucket}/{gcs_prefix}/weights/{run_name}/weights/{filename}"
     gcs.upload_file(local_weights_path, dest)
     return dest
@@ -99,6 +139,7 @@ def stage_config(
     config_name: Optional[str] = None,
     bucket: str = config.OUTPUT_BUCKET,
     extra_weights: Optional[Dict[str, str]] = None,
+    dedupe_weights: bool = True,
 ) -> Tuple[str, str, str, Dict[str, str]]:
     """Upload weights, rewrite the local YAML template's `weights:` field
     to point at the uploaded path, and upload the resulting config.
@@ -121,7 +162,9 @@ def stage_config(
     """
     from . import gcs  # deferred, see stage_weights
 
-    weights_uri = stage_weights(local_weights_path, run_name, gcs_prefix, bucket=bucket)
+    weights_uri = stage_weights(
+        local_weights_path, run_name, gcs_prefix, bucket=bucket, dedupe=dedupe_weights
+    )
     yaml_text = Path(local_yaml_path).read_text(encoding="utf-8")
     new_yaml_text = rewrite_weights_field(yaml_text, weights_uri)
 
@@ -129,7 +172,8 @@ def stage_config(
     for field_name, local_path in (extra_weights or {}).items():
         filename = f"{field_name}_{Path(local_path).name}"
         extra_uri = stage_weights(
-            local_path, run_name, gcs_prefix, bucket=bucket, weights_filename=filename
+            local_path, run_name, gcs_prefix, bucket=bucket, weights_filename=filename,
+            dedupe=dedupe_weights,
         )
         new_yaml_text = rewrite_yaml_field(new_yaml_text, field_name, extra_uri)
         extra_weight_uris[field_name] = extra_uri

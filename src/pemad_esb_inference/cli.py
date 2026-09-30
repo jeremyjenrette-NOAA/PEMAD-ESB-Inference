@@ -6,7 +6,7 @@ import dataclasses
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -173,6 +173,7 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             run_name=run_name,
             gcs_prefix=args.gcs_prefix,
             extra_weights=extra_weights or None,
+            dedupe_weights=not args.no_dedupe_weights,
         )
         print(f"Staged weights {args.weights_file} -> {weights_uri}")
         for field_name, uri in extra_weight_uris.items():
@@ -190,10 +191,17 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             yaml_config_uri = dest
 
     output_folder = args.output_folder or f"{args.gcs_prefix}/output/"
+    output_file = None
 
     if args.combined_image_contract and resolved_image_paths is not None:
         combined_config = yaml.safe_load(yaml_config_text) or {}
-        output_file = f"gs://{config.OUTPUT_BUCKET}/{output_folder.rstrip('/')}/annotations.json"
+        # Run-specific filename (nested under run_name) instead of a fixed
+        # "annotations.json" -- the old fixed name meant every run using the
+        # same --output-folder silently overwrote the previous run's output.
+        output_file = (
+            f"gs://{config.OUTPUT_BUCKET}/{output_folder.rstrip('/')}/"
+            f"{run_name}/annotations.json"
+        )
         manifest = input_builder.combined_contract_manifest(
             resolved_image_paths, output_file, combined_config
         )
@@ -237,6 +245,7 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             survey_sample=survey_sample,
             extra_weights=extra_weight_uris or None,
             staged_input=staged_input_info,
+            output_file=output_file,
         )
         card_uri = upload_run_card(card)
         print(f"Run card -> {card_uri}")
@@ -264,7 +273,10 @@ def cmd_trigger(args: argparse.Namespace) -> None:
         print(f"Found job: {job_name}")
         final_state = poll_until_terminal(job_name)
         print(f"Final state: {final_state}")
-        print(f"Expected output: gs://{config.OUTPUT_BUCKET}/{output_folder}")
+        if output_file:
+            print(f"Expected output: {output_file}")
+        else:
+            print(f"Expected output: gs://{config.OUTPUT_BUCKET}/{output_folder}")
 
 
 def cmd_stage_weights(args: argparse.Namespace) -> None:
@@ -273,6 +285,7 @@ def cmd_stage_weights(args: argparse.Namespace) -> None:
         run_name=args.run_name,
         gcs_prefix=args.gcs_prefix,
         weights_filename=args.weights_filename,
+        dedupe=not args.no_dedupe_weights,
     )
     print(f"Staged weights -> {dest}")
 
@@ -286,11 +299,74 @@ def cmd_stage_config(args: argparse.Namespace) -> None:
         gcs_prefix=args.gcs_prefix,
         config_name=args.config_name,
         extra_weights=extra_weights or None,
+        dedupe_weights=not args.no_dedupe_weights,
     )
     print(f"Staged weights -> {weights_uri}")
     for field_name, uri in extra_weight_uris.items():
         print(f"Staged {field_name} weights -> {uri}")
     print(f"Staged config -> {dest}")
+
+
+def cmd_stage_cleanup(args: argparse.Namespace) -> None:
+    """List (default) or delete (--force) old staging/ run folders.
+
+    Every trigger that spans multiple GCS folders copies its inputs
+    into a fresh gs://<bucket>/<gcs_prefix>/staging/<run_name>/ folder
+    (see input_staging.py); nothing ever removes those folders on its
+    own, so they grow without bound as more runs are triggered. This
+    groups objects under staging/ by run folder, reports total size,
+    and -- only with --force -- deletes the folders whose newest file
+    is older than --older-than-days. Recent folders are always left
+    alone (by design: staged inputs double as a fixed candidate set
+    for comparing model output across runs, so this only reclaims
+    space from runs old enough that nobody is still comparing against
+    them).
+    """
+    from . import gcs
+
+    prefix = f"gs://{config.OUTPUT_BUCKET}/{args.gcs_prefix}/staging/"
+    entries = gcs.list_prefix_with_metadata(prefix)
+    if not entries:
+        print(f"No staged files under {prefix}")
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.older_than_days)
+
+    runs: dict = {}
+    for uri, size, created in entries:
+        after = uri.split("/staging/", 1)[1]
+        run_folder = after.split("/", 1)[0]
+        entry = runs.setdefault(run_folder, {"size": 0, "count": 0, "newest": created})
+        entry["size"] += size
+        entry["count"] += 1
+        if created and (entry["newest"] is None or created > entry["newest"]):
+            entry["newest"] = created
+
+    total_bytes = sum(info["size"] for info in runs.values())
+    print(f"{len(runs)} staged run folder(s) under {prefix} ({total_bytes / 1e9:.2f} GB total)")
+
+    stale = {
+        run: info for run, info in runs.items()
+        if info["newest"] is not None and info["newest"] < cutoff
+    }
+    stale_bytes = sum(info["size"] for info in stale.values())
+    print(f"{len(stale)} folder(s) older than {args.older_than_days} day(s) ({stale_bytes / 1e9:.2f} GB):")
+    for run, info in sorted(stale.items(), key=lambda kv: kv[1]["newest"]):
+        print(
+            f"  {run}  {info['count']} file(s)  {info['size'] / 1e6:.1f} MB  "
+            f"staged {info['newest']:%Y-%m-%d}"
+        )
+
+    if not stale:
+        return
+    if not args.force:
+        print("\nDry run -- pass --force to actually delete the folder(s) listed above.")
+        return
+
+    for run in stale:
+        run_prefix = f"{prefix}{run}/"
+        deleted = gcs.delete_prefix(run_prefix)
+        print(f"Deleted {deleted} object(s) under {run_prefix}")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -431,6 +507,15 @@ def build_parser() -> argparse.ArgumentParser:
              "FileNotFoundError. Pass this flag to submit the original (unstaged) paths instead.",
     )
     p_trigger.add_argument(
+        "--no-dedupe-weights", action="store_true",
+        help="Skip content-addressed weights staging. By default, staged weights "
+             "(--weights-file / --extra-weights) are hashed and uploaded to a shared, "
+             "run-independent gs://.../weights/by-hash/<sha256>/ path -- if this exact "
+             "file was already staged by any prior run, the upload is skipped instead of "
+             "creating another full copy. Pass this flag to always upload to a fresh, "
+             "run-scoped path instead (the old behavior).",
+    )
+    p_trigger.add_argument(
         "--combined-image-contract", action="store_true",
         help="This model's container is built on the newer combined-image contract (app.py + "
              "model.py + inference_runner.py all in one image, e.g. star-cascade, forked from "
@@ -452,6 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage_weights.add_argument("--run-name", required=True, help="Run name -- becomes part of the staged GCS path")
     p_stage_weights.add_argument("--gcs-prefix", required=True, help="Folder prefix, e.g. your username")
     p_stage_weights.add_argument("--weights-filename", help="Override the uploaded filename (default: local filename)")
+    p_stage_weights.add_argument(
+        "--no-dedupe-weights", action="store_true",
+        help="Skip content-addressed staging and always upload to a fresh, run-scoped "
+             "path, even if this exact file is already staged elsewhere. See `trigger "
+             "--no-dedupe-weights` help.",
+    )
     p_stage_weights.set_defaults(func=cmd_stage_weights)
 
     p_stage_config = sub.add_parser(
@@ -472,7 +563,30 @@ def build_parser() -> argparse.ArgumentParser:
              "multi-weight (cascade) models. Repeatable -- see `trigger --extra-weights` help "
              "and docs/two-stage-cascade.md.",
     )
+    p_stage_config.add_argument(
+        "--no-dedupe-weights", action="store_true",
+        help="Skip content-addressed staging and always upload to a fresh, run-scoped "
+             "path, even if this exact file is already staged elsewhere. See `trigger "
+             "--no-dedupe-weights` help.",
+    )
     p_stage_config.set_defaults(func=cmd_stage_config)
+
+    p_stage_cleanup = sub.add_parser(
+        "stage-cleanup",
+        help="Report (and optionally delete) old run folders under the staging/ prefix",
+    )
+    p_stage_cleanup.add_argument("--gcs-prefix", required=True, help="Folder prefix, e.g. your username")
+    p_stage_cleanup.add_argument(
+        "--older-than-days", type=int, default=30,
+        help="Only report/delete staging run folders whose newest file is older than this "
+             "many days (default: 30). Folders newer than this are always left alone.",
+    )
+    p_stage_cleanup.add_argument(
+        "--force", action="store_true",
+        help="Actually delete the eligible folders. Without this flag, only reports what "
+             "would be deleted (dry run, the default).",
+    )
+    p_stage_cleanup.set_defaults(func=cmd_stage_cleanup)
 
     p_status = sub.add_parser("status", help="Check DAG run / task status")
     p_status.add_argument(
