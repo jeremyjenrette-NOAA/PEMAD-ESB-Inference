@@ -13,6 +13,7 @@ dependencies = [
     "google-cloud-batch>=0.17",
     "google-cloud-logging>=3.5",
     "PyYAML>=6.0",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]

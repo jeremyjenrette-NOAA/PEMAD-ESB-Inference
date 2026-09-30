@@ -175,9 +175,10 @@ pemad-infer trigger \
   --extra-weights taxonomy_json=models/24star_yolo12n_gcp_20260909_174845/weights/star_taxonomy.json \
   --yaml-config configs/two_stage/template.yaml \
   --combined-image-contract \
-  --run-name star-cascade_20260930 \
+  --stereo-side left \
+  --run-name star-cascade_20260930_left_v2 \
   --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
-  --sample-rate 5 \
+  --sample-rate 500 \
   --gcs-prefix jeremy \
   --wait
 ```
@@ -284,6 +285,39 @@ anything is submitted. This is a pre-flight provenance record,
 independent of Airflow's own post-hoc archived-config YAML. Skip it with
 `--no-card` if you don't want one for a given run.
 
+### Results viewer assets
+
+`export-viewer-assets` turns a completed run into the crop thumbnails a
+results viewer needs. The kwcoco `annotations.json` a run produces only
+has bboxes and bare filenames -- no pixels, and no full `gs://` path (the
+model container only ever sees basenames once inputs are staged), so this
+re-derives everything from the run card:
+
+```bash
+pemad-infer export-viewer-assets \
+  --run-card gs://ggn-nmfs-osi-dev-1-data/jeremy/run_cards/star-cascade_2026-09-30T182952.802318+0000.json \
+  --output-dir ./viewer_assets
+```
+
+For each image referenced in the annotations, this downloads the
+*original* full-resolution frame and re-applies the exact stereo crop
+`model.py` applied -- using that image's own recorded `stereo_side` /
+`stereo_crop_x_offset` / `width` / `height`, so there's no need to
+duplicate `model.py`'s split logic here. It writes:
+
+- `context/<image_id>.jpg` -- a resized whole-eye-crop thumbnail, for orientation (capped at `--max-context-dim`, default 900px)
+- `crops/<annotation_id>.jpg` -- a padded crop around just that detection's bbox (capped at `--max-crop-dim`, default 320px; padding via `--crop-padding-pct`, default 15% of the box's own width/height)
+- `manifest.json` -- image + annotation metadata (bbox, category, genus/species + confidences) with relative paths to the thumbnails above
+
+...and zips the whole `--output-dir` into `<output-dir>.zip` by default
+(skip with `--no-zip`) -- the easiest way to get the assets off a
+workstation that isn't otherwise reachable (e.g. for uploading
+somewhere else to build the viewer from).
+
+An image whose filename has no match in the run's input manifest (would
+only happen if the manifest and annotations.json somehow disagree) is
+skipped and reported, rather than failing the whole export.
+
 ## Layout
 
 - `src/pemad_esb_inference/` -- the package
@@ -295,10 +329,11 @@ independent of Airflow's own post-hoc archived-config YAML. Skip it with
   - `survey_sampler.py` -- samples 1-in-N images from a survey folder, stratified per leaf folder, excluding non-conforming leaf-folder names (e.g. `auv`) by default
   - `config_builder.py` -- stages local weights (content-addressed/deduplicated by default, see above) + rewrites a local YAML template's `weights:` field automatically (and, via `--extra-weights`, any number of additional named weight fields for multi-weight/cascade models)
   - `run_card.py` -- builds and uploads a pre-flight provenance "run card" for a trigger
-  - `gcs.py` -- small google-cloud-storage wrappers (upload/download/list/exists/delete)
+  - `viewer_export.py` -- re-derives per-detection crop thumbnails + a `manifest.json` from a completed run's run card (see "Results viewer assets" above)
+  - `gcs.py` -- small google-cloud-storage wrappers (upload/download text+bytes/list/exists/delete)
   - `airflow_client.py` -- triggers/queries the DAG via `gcloud composer environments run`
   - `batch_monitor.py` -- resolves and polls the resulting Cloud Batch job
-  - `cli.py` -- the `pemad-infer` command (`models|build-input|trigger|status|stage-weights|stage-config|stage-cleanup`)
+  - `cli.py` -- the `pemad-infer` command (`models|build-input|trigger|status|stage-weights|stage-config|stage-cleanup|export-viewer-assets`)
 - `configs/` -- known-good pipeline YAML configs, one per model/weight-set
 - `docs/` -- architecture notes, the permissions/troubleshooting model, the BYOM/Docker reference, and the two-stage cascade model guide
 - `examples/` -- copy-paste shell examples, plus a structural (untested) template for a cascade model's `model.py`

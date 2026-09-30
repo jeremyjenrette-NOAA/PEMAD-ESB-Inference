@@ -379,6 +379,38 @@ def cmd_stage_cleanup(args: argparse.Namespace) -> None:
         print(f"Deleted {deleted} object(s) under {run_prefix}")
 
 
+
+def cmd_export_viewer_assets(args: argparse.Namespace) -> None:
+    """Download a completed run's original frames and write per-detection
+    crop thumbnails + a manifest.json for the results viewer. See
+    viewer_export.py's module docstring for why this needs the run card
+    (not just annotations.json) and how the stereo crop is re-derived."""
+    from .viewer_export import export
+
+    result = export(
+        run_card_uri=args.run_card,
+        output_dir=args.output_dir,
+        max_context_dim=args.max_context_dim,
+        max_crop_dim=args.max_crop_dim,
+        crop_padding_pct=args.crop_padding_pct,
+        make_zip=not args.no_zip,
+    )
+    print(
+        f"\nWrote {result['image_count']} context thumbnail(s) and "
+        f"{result['annotation_count']} crop(s) to {result['output_dir']}"
+    )
+    print(f"Manifest: {result['manifest_path']}")
+    if result["skipped_images"]:
+        preview = ", ".join(result["skipped_images"][:10])
+        more = " ..." if len(result["skipped_images"]) > 10 else ""
+        print(
+            f"WARNING: {len(result['skipped_images'])} image(s) referenced in annotations.json "
+            f"had no matching entry in the input manifest and were skipped: {preview}{more}"
+        )
+    if result["zip_path"]:
+        print(f"Zipped: {result['zip_path']} -- upload this to get the assets off this machine.")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     if args.logical_date:
         print(task_states_for_run(args.logical_date))
@@ -615,6 +647,39 @@ def build_parser() -> argparse.ArgumentParser:
              "would be deleted (dry run, the default).",
     )
     p_stage_cleanup.set_defaults(func=cmd_stage_cleanup)
+
+    p_export_viewer = sub.add_parser(
+        "export-viewer-assets",
+        help="Download a completed run's original frames and write per-detection crop "
+             "thumbnails + a manifest.json for the results viewer",
+    )
+    p_export_viewer.add_argument(
+        "--run-card", required=True,
+        help="gs:// path to the run card uploaded at trigger time (list "
+             "gs://<bucket>/<gcs-prefix>/run_cards/ to find it)",
+    )
+    p_export_viewer.add_argument(
+        "--output-dir", required=True,
+        help="Local directory to write context/, crops/, and manifest.json into",
+    )
+    p_export_viewer.add_argument(
+        "--max-context-dim", type=int, default=900,
+        help="Cap the longer side of each full-frame context thumbnail, in pixels (default: 900)",
+    )
+    p_export_viewer.add_argument(
+        "--max-crop-dim", type=int, default=320,
+        help="Cap the longer side of each per-detection crop thumbnail, in pixels (default: 320)",
+    )
+    p_export_viewer.add_argument(
+        "--crop-padding-pct", type=float, default=15.0,
+        help="Extra context padded around each bbox crop, as a percent of the box's own "
+             "width/height (default: 15)",
+    )
+    p_export_viewer.add_argument(
+        "--no-zip", action="store_true",
+        help="Skip zipping output-dir into a single archive (zipped by default, for easy upload)",
+    )
+    p_export_viewer.set_defaults(func=cmd_export_viewer_assets)
 
     p_status = sub.add_parser("status", help="Check DAG run / task status")
     p_status.add_argument(

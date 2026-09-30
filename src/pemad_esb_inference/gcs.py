@@ -33,6 +33,14 @@ def download_text(gs_uri: str) -> str:
     return blob.download_as_text()
 
 
+def download_bytes(gs_uri: str) -> bytes:
+    """Download an object's raw bytes -- used by viewer_export.py to pull
+    original image frames into PIL without a local temp file."""
+    bucket_name, blob_path = _split_uri(gs_uri)
+    blob = _get_client().bucket(bucket_name).blob(blob_path)
+    return blob.download_as_bytes()
+
+
 def upload_text(text: str, gs_uri: str, content_type: str = "text/plain") -> str:
     bucket_name, blob_path = _split_uri(gs_uri)
     blob = _get_client().bucket(bucket_name).blob(blob_path)
