@@ -187,6 +187,48 @@ consecutive runs against the same `--output-folder` no longer overwrite
 each other's output. That resolved path is also printed at the end of a
 `--wait` run and recorded on the run card.
 
+#### Stereo splicing: `--stereo-side`
+
+HabCam frames are spliced left+right stereo pairs in one wide image.
+Running the detector on the full spliced frame means a real organism
+visible in both eyes' overlap zone gets detected *and* classified
+twice -- once per eye, at two different x-positions -- which
+double-counts it (confirmed 2026-09-30 against a real survey-scale
+star-cascade run). `--stereo-side {full,left,right}` (default `full`,
+for backward compatibility) fixes this at the source rather than
+post-hoc: it's threaded into the manifest's inline config, and the
+combined-image-contract `model.py` crops each image to that half
+*before* the stage-1 detector ever sees it, so bbox coordinates come
+out already relative to the single eye -- no remapping needed
+downstream. Only meaningful with `--combined-image-contract`; `trigger`
+exits early with a clear message if you pass `--stereo-side left`/
+`right` without it.
+```bash
+pemad-infer trigger \
+  --model star-cascade \
+  --weights-file best.pt \
+  --extra-weights classifier_weights=star_tax.pt taxonomy_json=star_taxonomy.json \
+  --yaml-config configs/two_stage/template.yaml \
+  --combined-image-contract \
+  --stereo-side left \
+  --run-name star-cascade_20260930_left \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
+  --sample-rate 5 \
+  --gcs-prefix jeremy \
+  --wait
+```
+To cover both eyes, trigger twice (once with `--stereo-side left`, once
+`right`, ideally under different `--run-name`s so their outputs don't
+collide) -- there's no single-run "both" mode yet. Each output image
+entry also records `stereo_side` and `stereo_crop_x_offset` (how far
+the crop's left edge sits from the original full frame, `0` for `full`/
+`left` or half the frame width for `right`) -- useful if a later step
+ever needs to map a detection back to full-frame coordinates (e.g. for
+real stereo triangulation instead of just avoiding double-counting).
+Video inputs aren't split yet -- `model.py` logs a warning and falls
+back to the full frame rather than silently skipping the split; not
+needed for the current HabCam-stills use case.
+
 ### Input staging (multi-folder inputs) and cleanup
 
 When a resolved image list (from `--survey-prefix`, `--habcam`, or
