@@ -145,6 +145,21 @@ pemad-infer trigger \
   --gcs-prefix jeremy \
   --dry-run
 ```
+
+local
+```bash
+PEMAD_DAG_ID=optics-pipeline pemad-infer trigger \
+  --model ultralytics \
+  --weights-file models/24star_yolo12n_gcp_20260909_174845/weights/best.pt \
+  --extra-weights classifier_weights=models/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt \
+  --yaml-config configs/two_stage/template.yaml \
+  --run-name star_cascade_20260929b \
+  --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
+  --sample-rate 500 \
+  --gcs-prefix jeremy \
+  --dry-run
+```
+
 (also available as `examples/trigger_cancer_crab_cascade.sh`). `FIELD`
 must match whatever the container's `model.py` actually reads from its
 config -- see `docs/two-stage-cascade.md` for the full walkthrough,

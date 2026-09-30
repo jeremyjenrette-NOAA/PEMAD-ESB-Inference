@@ -11,10 +11,36 @@ VIAME Model to OSI" appendix:
     (paired lists):      {"instances": [{"input_images": [[left...], [right...]]}]}
   VIAME-family stereo
     (left/right dirs):   {"instances": [{"input_paths": ["gs://left_dir/", "gs://right_dir/"]}]}
+
+Combined-image contract (added 2026-09-30): a *third*, structurally
+different manifest shape used by models built on the newer single-image
+template (app.py + model.py + inference_runner.py all in one Docker image,
+e.g. forked from `optics-models-ultralytics-detection` -- this is what the
+`star-cascade` model_type actually runs). Confirmed directly from that
+template's real `inference_runner.py`/`app.py` source, not guessed:
+
+  Combined-image contract: {"instances": [{"input_files": ["gs://...", ...],
+                                            "output_file": "gs://.../results.json",
+                                            "config": {...}}]}
+
+This is NOT a drop-in replacement for the Ultralytics-family shape above --
+that flat `{"instances": ["gs://...", ...]}` list is what the *older*
+wrapper contract (`ultralytics_model_type_inference_runner.py`, used by
+`fish-segmentation-bw`-style models) reads; this template's
+`inference_runner.py` never reads `YAML_CONFIG_PATH` at all, so a plain
+flat-string-list manifest crashes it immediately (`app.py`'s
+`instance.get("config", {})` on a bare string -> `AttributeError`,
+confirmed 2026-09-30 from a real failed star-cascade job's logs: every
+instance failed with `'str' object has no attribute 'get'`). Both the
+weights/classifier_weights/taxonomy_json/detector-payload config AND the
+output destination must be embedded *inline* per instance instead of
+coming from a separately-referenced YAML file. `cli.py`'s
+`--combined-image-contract` flag switches `build-input`/`trigger` to build
+this shape instead.
 """
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 
 def ultralytics_manifest(image_or_video_paths: Sequence[str]) -> Dict:
@@ -37,12 +63,36 @@ def viame_stereo_folders_manifest(left_folder: str, right_folder: str) -> Dict:
     return {"instances": [{"input_paths": [left_folder, right_folder]}]}
 
 
+def combined_contract_manifest(
+    image_paths: Sequence[str], output_file: str, config: Optional[Dict] = None
+) -> Dict:
+    """Manifest for the combined-image contract -- see module docstring.
+
+    One instance covers the whole batch (all `image_paths`, one shared
+    `config`, one `output_file`) -- `app.py` iterates a single instance's
+    `input_files` itself and writes one results file, it doesn't expect
+    one instance per image.
+    """
+    return {
+        "instances": [
+            {
+                "input_files": list(image_paths),
+                "output_file": output_file,
+                "config": config or {},
+            }
+        ]
+    }
+
+
 def manifest_for_family(family: str, image_paths: Sequence[str]) -> Dict:
     """Pick the right manifest shape for a model family.
 
     Only covers the common single-camera-images case (the one the
     `trigger` / `build-input` CLI commands drive today) -- call the
-    `viame_*` builders above directly for video/stereo inputs.
+    `viame_*` builders above directly for video/stereo inputs, and
+    `combined_contract_manifest` directly (via `--combined-image-contract`)
+    for models on the newer combined-image contract, which isn't a family
+    in this sense at all -- see its own docstring above.
     """
     if family == "ultralytics":
         return ultralytics_manifest(image_paths)

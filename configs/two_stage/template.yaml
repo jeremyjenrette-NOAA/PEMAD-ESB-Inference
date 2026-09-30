@@ -1,21 +1,26 @@
-# PLACEHOLDER TEMPLATE -- field names below (especially `classifier_weights`
-# and everything under `classifier_payload`) are NOT confirmed against a real
-# cascade container's model.py. They're a starting convention matching how
-# `examples/cascade_model_template.py` reads its `config` dict
-# (`config.get("detector_weights"/"classifier_weights", ...)`), so this file
-# exists as something to point `pemad-infer trigger --yaml-config` /
-# `--extra-weights` at while building the real container -- rename fields
-# here (and in the container's model.py) together once the real contract is
-# settled. See docs/two-stage-cascade.md.
+# Two-stage cascade config. Field names confirmed 2026-09-29 against the
+# real cascade model.py (forked from optics-models-ultralytics-detection):
+# `weights` (stage-1 detector), `classifier_weights` (stage-2 classifier
+# state_dict) and `taxonomy_json` (id->genus/species name maps, required at
+# inference time same as training) are all staged the same way via
+# `--extra-weights <field>=<local path>`. See docs/two-stage-cascade.md.
 model_family: ultralytics # cascades register as an Ultralytics-shaped model_type (command=["python"]) -- see docs/two-stage-cascade.md
 
 # Stage 1 (detector) weights. Staged/rewritten by `--weights-file` exactly
 # like any single-model Ultralytics config.
 weights: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/24star_yolo12n_gcp_20260909_174845/weights/best.pt"
 
-# Stage 2 (classifier) weights. Staged/rewritten by
-# `--extra-weights classifier_weights=<local path to crabdata_tax.pt>`.
+# Stage 2 (classifier) weights -- a state_dict, not a full model object;
+# model.py reconstructs HierarchicalTaxonomicClassifier(backbone, num_genera,
+# num_species) before loading it. Staged/rewritten by
+# `--extra-weights classifier_weights=<local path to star_tax.pt>`.
 classifier_weights: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt"
+
+# Taxonomy JSON -- required at inference time, not just training: this is
+# what tells model.py num_genera/num_species and the id->name maps used to
+# label each classified crop. Staged/rewritten by
+# `--extra-weights taxonomy_json=<local path to star_taxonomy.json>`.
+taxonomy_json: "gs://ggn-nmfs-osi-dev-1-data/jeremy/weights/24star_yolo12n_gcp_20260909_174845/weights/star_taxonomy.json"
 
 output_type: kwcoco
 upload_dataset_to_output_folder: no # option yes/no
@@ -23,15 +28,19 @@ upload_dataset_to_output_folder: no # option yes/no
 # Stage 1: detector inference params (mirrors configs/ultralytics/24star.yaml).
 payload:
   conf: 0.1
-  iou: 0.1
-  nms_iou: 0.65
+  iou: 0.5  # NMS IoU threshold -- this IS the "nms_iou" knob; Ultralytics' own
+            # predict() kwarg for it is just `iou`. A separate `nms_iou` key
+            # (removed 2026-09-29) isn't a real argument and crashes the
+            # container with SyntaxError: 'nms_iou' is not a valid YOLO
+            # argument -- confirmed from the ultralytics-f1a0995a job's logs.
   imgsz: 1024
   device: cpu
   batch: 4
   max_det: 30
 
-# Stage 2: classifier params -- confirm real field names/values against
-# crabdata_tax.pt's actual training config before relying on these.
-classifier_payload:
-  input_size: 224
-  device: cpu
+# Stage 2: classifier preprocessing is fixed by model.py (confirmed against
+# config/train_classifier.py's eval transform: Resize((224,224)) + ImageNet
+# normalize) -- no separate classifier_payload block needed. Optionally
+# override the backbone name if a future run uses something other than
+# convnext_tiny:
+# classifier_backbone: "convnext_tiny"

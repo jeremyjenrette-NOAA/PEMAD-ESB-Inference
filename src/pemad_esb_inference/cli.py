@@ -9,6 +9,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from . import config, gcs, input_builder
 from .input_staging import flatten_to_staging, spans_multiple_folders
 from .airflow_client import list_runs, task_states_for_run, trigger_dag
@@ -79,7 +81,22 @@ def cmd_build_input(args: argparse.Namespace) -> None:
     if not image_paths:
         sys.exit("No image paths resolved -- pass --images, --habcam, or --survey-prefix.")
 
-    manifest = input_builder.manifest_for_family(definition.family, image_paths)
+    if args.combined_image_contract:
+        if not args.output_file:
+            sys.exit("--combined-image-contract requires --output-file (a gs:// URI).")
+        combined_config = {}
+        if args.yaml_config:
+            text = (
+                gcs.download_text(args.yaml_config)
+                if args.yaml_config.startswith("gs://")
+                else Path(args.yaml_config).read_text(encoding="utf-8")
+            )
+            combined_config = yaml.safe_load(text) or {}
+        manifest = input_builder.combined_contract_manifest(
+            image_paths, args.output_file, combined_config
+        )
+    else:
+        manifest = input_builder.manifest_for_family(definition.family, image_paths)
 
     if args.upload:
         gcs.upload_json(manifest, args.upload)
@@ -98,6 +115,7 @@ def cmd_trigger(args: argparse.Namespace) -> None:
 
     input_file_uri = args.input_file
     staged_input_info = None
+    resolved_image_paths = None
     if not input_file_uri:
         image_paths, survey_sample = _resolve_image_paths(args)
         if not image_paths:
@@ -118,14 +136,23 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             print(f"Staged {len(image_paths)} file(s) -> {staging_prefix}")
 
         input_count = len(image_paths)
-        manifest = input_builder.manifest_for_family(definition.family, image_paths)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        input_file_uri = (
-            f"gs://{config.OUTPUT_BUCKET}/{args.gcs_prefix}/inputs/"
-            f"{args.model}_{timestamp}.json"
-        )
-        gcs.upload_json(manifest, input_file_uri)
-        print(f"Built and uploaded input manifest ({len(image_paths)} instances) -> {input_file_uri}")
+
+        if args.combined_image_contract:
+            # Built further below instead, once the (possibly staged/
+            # rewritten) yaml config is known -- the combined-image
+            # contract embeds that config inline per instance, so the
+            # manifest can't be finalized until after the weights/yaml
+            # staging block runs. See input_builder.combined_contract_manifest.
+            resolved_image_paths = image_paths
+        else:
+            manifest = input_builder.manifest_for_family(definition.family, image_paths)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            input_file_uri = (
+                f"gs://{config.OUTPUT_BUCKET}/{args.gcs_prefix}/inputs/"
+                f"{args.model}_{timestamp}.json"
+            )
+            gcs.upload_json(manifest, input_file_uri)
+            print(f"Built and uploaded input manifest ({len(image_paths)} instances) -> {input_file_uri}")
 
     extra_weights = _parse_extra_weights(args.extra_weights)
     if extra_weights and not args.weights_file:
@@ -163,6 +190,24 @@ def cmd_trigger(args: argparse.Namespace) -> None:
             yaml_config_uri = dest
 
     output_folder = args.output_folder or f"{args.gcs_prefix}/output/"
+
+    if args.combined_image_contract and resolved_image_paths is not None:
+        combined_config = yaml.safe_load(yaml_config_text) or {}
+        output_file = f"gs://{config.OUTPUT_BUCKET}/{output_folder.rstrip('/')}/annotations.json"
+        manifest = input_builder.combined_contract_manifest(
+            resolved_image_paths, output_file, combined_config
+        )
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        input_file_uri = (
+            f"gs://{config.OUTPUT_BUCKET}/{args.gcs_prefix}/inputs/"
+            f"{args.model}_{timestamp}.json"
+        )
+        gcs.upload_json(manifest, input_file_uri)
+        print(
+            f"Built and uploaded combined-image-contract input manifest "
+            f"({len(resolved_image_paths)} files, 1 instance, output_file={output_file}) "
+            f"-> {input_file_uri}"
+        )
 
     conf = {
         "model_type": args.model,
@@ -292,6 +337,25 @@ def build_parser() -> argparse.ArgumentParser:
              "anomalous folder's images are safe to include.",
     )
     p_build.add_argument("--upload", help="gs:// URI to upload the manifest to (otherwise prints to stdout)")
+    p_build.add_argument(
+        "--combined-image-contract", action="store_true",
+        help="Build the manifest shape needed by models on the newer combined-image contract "
+             "(app.py + model.py + inference_runner.py all in one image, e.g. the star-cascade "
+             "container forked from optics-models-ultralytics-detection) instead of the "
+             "family-based flat/VIAME shapes -- see input_builder.py's module docstring. "
+             "Requires --output-file; --yaml-config optionally supplies the inline per-instance "
+             "config (weights/classifier_weights/taxonomy_json/payload/...).",
+    )
+    p_build.add_argument(
+        "--output-file",
+        help="With --combined-image-contract: the exact gs:// URI the container will write its "
+             "results to (this contract's app.py writes to one explicit file, not just a folder).",
+    )
+    p_build.add_argument(
+        "--yaml-config",
+        help="With --combined-image-contract: gs:// URI or local path to a YAML file parsed and "
+             "embedded as each instance's inline 'config' dict.",
+    )
     p_build.set_defaults(func=cmd_build_input)
 
     p_trigger = sub.add_parser("trigger", help="Trigger a DAG run")
@@ -365,6 +429,19 @@ def build_parser() -> argparse.ArgumentParser:
              "staging folder before triggering (see input_staging.py) -- this sidesteps a known "
              "bug in the inference wrapper where a batch spanning multiple folders crashes with "
              "FileNotFoundError. Pass this flag to submit the original (unstaged) paths instead.",
+    )
+    p_trigger.add_argument(
+        "--combined-image-contract", action="store_true",
+        help="This model's container is built on the newer combined-image contract (app.py + "
+             "model.py + inference_runner.py all in one image, e.g. star-cascade, forked from "
+             "optics-models-ultralytics-detection) rather than the older YAML_CONFIG_PATH-plus-"
+             "flat-instances-list wrapper contract. Changes the input manifest to one instance "
+             "with input_files/output_file/config embedded inline (built from --yaml-config after "
+             "weights staging) instead of a flat instances-list -- required for this model's "
+             "inference_runner.py, which never reads YAML_CONFIG_PATH at all. Confirmed 2026-09-30 "
+             "after every instance in a real run failed with \"'str' object has no attribute "
+             "'get'\" using the old flat manifest shape. See input_builder.py's module docstring "
+             "for the full contract difference.",
     )
     p_trigger.set_defaults(func=cmd_trigger)
 
