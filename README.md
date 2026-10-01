@@ -359,14 +359,31 @@ inspecting the schema/ingestion locally before GCS hosting is wired up.
 `runs.run_card_uri` is `UNIQUE` -- `ingest-run` is meant to be run once
 per export, not repeatedly on the same run.
 
+If you already have a database created before Phase 2 (full review
+history, see below), apply the migration instead of recreating from
+scratch:
+
+```bash
+psql "postgresql://postgres:postgres@localhost:5432/viewer_dev" \
+  -f db/migrations/0002_review_history.sql
+```
+
+This drops the old 1:1 `UNIQUE` constraint on `reviews.detection_id`,
+adds the `latest_reviews` view (current verdict per detection), and
+rebuilds `retraining_labels` on top of it. No data is lost -- every
+existing review row is kept, and a detection's prior single review
+becomes the first row in its history. A fresh `db/schema.sql` already
+has this shape built in, so a new database doesn't need the migration.
+
 ### Running the Phase 1 read API locally
 
 `src/pemad_esb_inference/api.py` is a FastAPI service exposing the
-schema above over HTTP, read-only for now (write-back/review endpoints
-are Phase 2). It's a drop-in data source for the viewer -- `GET
-/runs/{id}` returns the same {run, images, annotations} shape the
-viewer's manifest.json already has, filtered/paginated server-side
-instead of shipping an entire run to the browser.
+schema above over HTTP. Phase 1 (reads) and Phase 2 (write-back/review)
+are both implemented here now -- `GET /runs/{id}` returns the same
+manifest-compatible shape the viewer already has, filtered/paginated
+server-side, with each annotation additionally carrying a `review`
+field (the current/latest verdict for that detection, or `null` if
+it's never been reviewed).
 
 ```bash
 pip install -e ".[db,api]"
@@ -380,6 +397,25 @@ curl "http://localhost:8000/runs/1?genus=Leptasterias&min_score=0.5"
 ```
 
 `PEMAD_DB_DSN` defaults to the local container above if unset.
+
+Submitting a review decision for a detection -- `decision` is one of
+`confirmed`/`rejected`/`relabeled`/`uncertain`; `corrected_genus` is
+required when relabeling. Every call *adds* a new review row rather
+than overwriting the last one (see "Review workflow" below for why):
+
+```bash
+curl -X POST http://localhost:8000/detections/1/review \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "confirmed", "reviewer": "jeremy.jenrette@noaa.gov"}'
+
+curl -X POST http://localhost:8000/detections/2/review \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "relabeled", "reviewer": "jeremy.jenrette@noaa.gov", \
+       "corrected_genus": "Leptasterias", "corrected_species": "tenera", \
+       "notes": "crop is clearly a different genus than predicted"}'
+
+curl http://localhost:8000/detections/1/reviews
+```
 
 ### Viewer (ported from the claude.ai Artifact prototype)
 
@@ -403,6 +439,38 @@ is left as a frozen UI/UX demo with its original placeholder/example
 data -- a published Artifact page can't reach a private API like this
 one (no general-purpose fetch capability), so it was never going to be
 the live tool; this page is.
+
+### Review workflow (Phase 2: write-back)
+
+The viewer's detail panel has a "Review" section: a "Reviewing as"
+field (persisted per-browser via `localStorage`, so you don't retype
+it every detection), Confirm/Reject/Relabel/Uncertain buttons,
+corrected-genus/species fields that only appear for Relabel, an
+optional notes field, and a submit button that `POST`s to
+`/detections/{id}/review`. The controls row also has a "Review
+status" filter (All/Unreviewed/Confirmed/Rejected/Relabeled/Uncertain)
+and each card in the grid shows a small badge for its current review
+status. Opening a detection's detail panel lazy-loads its full review
+history from `GET /detections/{id}/reviews` underneath the decision
+buttons.
+
+A detection being reviewed more than once -- a second auditor, or the
+same one changing their mind -- keeps every past verdict rather than
+overwriting it: `reviews` is 1:many per detection (`db/schema.sql` /
+`db/migrations/0002_review_history.sql`), and the `latest_reviews`
+view resolves "the current verdict" as the most recent row. This is
+deliberate: the prediction (`detections.genus`/`species`) and the
+human label (`reviews.corrected_genus`/`corrected_species`) always
+stay distinct, so prediction-vs-human-label performance can be tracked
+over time, and a disagreement between auditors is data, not something
+to discard.
+
+As of this writing, Phase 2 has been verified directly against a real
+Postgres instance (the schema/migration SQL and the `ReviewIn`
+pydantic validation) but **not yet run as a live `uvicorn` server
+against a real browser** -- unlike Phase 1, which was tested
+end-to-end on real data on two machines. Treat the review UI as built
+but not yet field-tested until that happens.
 
 ## Layout
 
@@ -428,6 +496,7 @@ the live tool; this page is.
 - `examples/` -- copy-paste shell examples, plus a structural (untested) template for a cascade model's `model.py`
 - `tests/` -- unit tests for the pure-Python pieces (manifest building, HabCam path resolution, config rewriting, run cards) -- no GCP credentials required to run these
 - `db/schema.sql` -- the Postgres schema `ingest-run` loads into (see "Loading a run into Postgres" above)
+- `db/migrations/` -- numbered migrations for databases created from an earlier `schema.sql` (see "Loading a run into Postgres" above)
 
 ## Known limitations / next steps
 

@@ -11,12 +11,14 @@
 --   * `detections` denormalizes run_id (not just image_id) because
 --     "show me everything from run X" is the primary query pattern
 --     for the viewer -- avoids an image join on the hot path.
---   * `reviews` is 1:1 with `detections` today (a UNIQUE constraint
---     enforces it) -- one current verdict per detection. If this ever
---     needs a full audit trail (who changed their mind, revision
---     history) that's a straightforward migration to a 1:many table;
---     not modeled now because Jeremy hasn't asked for it and it would
---     be speculative.
+--   * `reviews` is 1:many per detection (as of migrations/0002) --
+--     every confirm/reject/relabel action adds a row rather than
+--     overwriting the last one, so a disagreement between auditors or
+--     a changed call is preserved, not discarded. `latest_reviews`
+--     resolves "the current verdict" (DISTINCT ON, most recent); the
+--     original schema here had this 1:1 with a UNIQUE constraint --
+--     changed once Jeremy confirmed performance-tracking needed the
+--     full history, not just the latest state.
 --   * category_id/category_name are kept even though today's model
 --     only emits one category ("cancer_crab") -- known to be a
 --     leftover/misleading label from the training data (see prior
@@ -26,9 +28,10 @@
 -- Verified 2026-09-30 by loading Jeremy's real star-cascade_20260930_left_v2
 -- export (71 images, 80 detections) through the exact INSERT shapes
 -- db_ingest.load_into_postgres() uses -- row counts, FK integrity
--- (every detection's image belongs to its own run), the reviews
--- 1:1 UNIQUE constraint, and the retraining_labels view all confirmed
--- against that real data before this was committed.
+-- (every detection's image belongs to its own run), and (on that
+-- version of this schema, since superseded by migrations/0002 below)
+-- the reviews 1:1 UNIQUE constraint and retraining_labels view, all
+-- confirmed against that real data before this was committed.
 
 CREATE TABLE runs (
     id                  BIGSERIAL PRIMARY KEY,
@@ -84,7 +87,7 @@ CREATE TYPE review_decision AS ENUM ('confirmed', 'rejected', 'relabeled', 'unce
 
 CREATE TABLE reviews (
     id                  BIGSERIAL PRIMARY KEY,
-    detection_id         BIGINT NOT NULL UNIQUE REFERENCES detections(id) ON DELETE CASCADE,
+    detection_id         BIGINT NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
     decision            review_decision NOT NULL,
     corrected_genus      TEXT,                     -- set only when decision = 'relabeled'
     corrected_species    TEXT,
@@ -93,22 +96,35 @@ CREATE TABLE reviews (
     reviewed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_reviews_decision ON reviews(decision);
+CREATE INDEX idx_reviews_detection_latest ON reviews(detection_id, reviewed_at DESC);
+
+-- "The current verdict" per detection -- DISTINCT ON the most recent
+-- reviewed_at (id as a tiebreaker for same-timestamp rows). Every
+-- consumer that wants "the review", not "all reviews for this
+-- detection", reads this rather than re-deriving the same DISTINCT ON.
+CREATE VIEW latest_reviews AS
+SELECT DISTINCT ON (detection_id) *
+FROM reviews
+ORDER BY detection_id, reviewed_at DESC, id DESC;
 
 -- Retraining export reads from this view rather than the raw tables,
 -- so "what does a corrected label actually mean" only has to be
 -- defined once: relabeled -> the correction; confirmed -> the
--- original prediction; rejected/uncertain/no review yet -> excluded.
+-- original prediction; rejected/uncertain/no (current) review -> excluded.
+-- Reads the *latest* verdict only -- an earlier, superseded review on
+-- the same detection never contributes a label here even though it's
+-- still in `reviews` for history/agreement purposes.
 CREATE VIEW retraining_labels AS
 SELECT
     d.id AS detection_id,
     d.run_id,
     d.image_id,
     d.bbox_x, d.bbox_y, d.bbox_w, d.bbox_h,
-    COALESCE(r.corrected_genus, d.genus) AS genus,
-    COALESCE(r.corrected_species, d.species) AS species,
-    r.decision,
-    r.reviewer,
-    r.reviewed_at
+    COALESCE(lr.corrected_genus, d.genus) AS genus,
+    COALESCE(lr.corrected_species, d.species) AS species,
+    lr.decision,
+    lr.reviewer,
+    lr.reviewed_at
 FROM detections d
-JOIN reviews r ON r.detection_id = d.id
-WHERE r.decision IN ('confirmed', 'relabeled');
+JOIN latest_reviews lr ON lr.detection_id = d.id
+WHERE lr.decision IN ('confirmed', 'relabeled');

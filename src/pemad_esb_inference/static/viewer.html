@@ -222,6 +222,35 @@ button.link-btn {
 .sibling-thumb.active { border-color: var(--accent); }
 .sibling-thumb img { width: 100%; height: 100%; object-fit: cover; }
 
+.review-badge {
+  display: inline-flex; align-items: center; gap: 3px; font-size: 0.66rem; font-weight: 700;
+  border-radius: 5px; padding: 2px 6px; margin-top: 6px; width: fit-content; color: #0b0b0b;
+}
+.reviewer-field input { width: 100%; }
+.review-panel { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.review-panel h4 { margin: 0 0 8px; font-size: 0.85rem; }
+.review-status-line { font-size: 0.82rem; color: var(--text-2); margin-bottom: 10px; }
+.decision-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+button.decision-btn {
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer;
+}
+button.decision-btn.active { border-color: var(--accent); background: color-mix(in oklab, var(--accent) 18%, var(--surface-2)); }
+.correction-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+.correction-fields input { width: 100%; }
+textarea.review-notes { width: 100%; min-height: 56px; resize: vertical; font: inherit; }
+.review-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+button.submit-review-btn {
+  background: var(--accent); color: #0b0b0b; border: none; border-radius: 8px;
+  padding: 7px 14px; font-size: 0.85rem; font-weight: 700; cursor: pointer;
+}
+button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.review-history { margin-top: 14px; }
+.review-history-item {
+  font-size: 0.78rem; color: var(--text-2); padding: 6px 0; border-bottom: 1px solid var(--border);
+}
+.review-history-item:last-child { border-bottom: none; }
+
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -261,6 +290,21 @@ button.link-btn {
         <input type="range" id="min-score" min="0" max="1" step="0.01" value="0">
         <span class="slider-value" id="min-score-value">0.00</span>
       </div>
+    </div>
+    <div class="field reviewer-field">
+      <label for="reviewer-input">Reviewing as</label>
+      <input type="text" id="reviewer-input" placeholder="you@noaa.gov">
+    </div>
+    <div class="field">
+      <label for="review-status-select">Review status</label>
+      <select id="review-status-select">
+        <option value="">All</option>
+        <option value="unreviewed">Unreviewed</option>
+        <option value="confirmed">Confirmed</option>
+        <option value="rejected">Rejected</option>
+        <option value="relabeled">Relabeled</option>
+        <option value="uncertain">Uncertain</option>
+      </select>
     </div>
   </div>
   <div class="quick-actions">
@@ -313,6 +357,29 @@ button.link-btn {
     </div>
     <div class="detail-crop"><img id="detail-crop-img" alt="Detection crop"></div>
     <div class="detail-grid" id="detail-grid"></div>
+
+    <div class="review-panel">
+      <h4>Review</h4>
+      <div class="review-status-line" id="review-status-line">—</div>
+      <div class="decision-btns" id="decision-btns">
+        <button type="button" class="decision-btn" data-decision="confirmed">Confirm</button>
+        <button type="button" class="decision-btn" data-decision="rejected">Reject</button>
+        <button type="button" class="decision-btn" data-decision="relabeled">Relabel</button>
+        <button type="button" class="decision-btn" data-decision="uncertain">Uncertain</button>
+      </div>
+      <div class="correction-fields" id="correction-fields" hidden>
+        <input type="text" id="corrected-genus-input" placeholder="Corrected genus">
+        <input type="text" id="corrected-species-input" placeholder="Corrected species">
+      </div>
+      <textarea class="review-notes" id="review-notes-input" placeholder="Notes (optional)"></textarea>
+      <div class="review-actions">
+        <button type="button" class="submit-review-btn" id="submit-review-btn" disabled>Submit review</button>
+      </div>
+      <div id="review-submit-error" style="color:var(--critical); font-size:0.78rem; margin-top:6px;" hidden></div>
+      <div class="review-history" id="review-history">
+        <div style="font-size:0.78rem; color:var(--muted);">Loading history…</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -329,6 +396,7 @@ button.link-btn {
     maxScore: null,
     reviewMode: false,
     stereoFilter: "",
+    reviewStatusFilter: "",
     sort: "score-desc",
     selectedAnnotationId: null,
   };
@@ -336,6 +404,7 @@ button.link-btn {
   let manifest = null;
   let genusColor = {};
   let genusOrder = [];
+  let selectedDecision = null;
 
   function colorFor(genus) {
     return "var(" + (genusColor[genus] || "--muted") + ")";
@@ -348,6 +417,32 @@ button.link-btn {
   }
 
   function byId(id) { return document.getElementById(id); }
+
+  function getSavedReviewer() {
+    try { return localStorage.getItem("pemad_reviewer") || ""; } catch (e) { return ""; }
+  }
+  function saveReviewer(name) {
+    try { localStorage.setItem("pemad_reviewer", name); } catch (e) { /* ignore */ }
+  }
+
+  function reviewBadgeColor(decision) {
+    switch (decision) {
+      case "confirmed": return "var(--good)";
+      case "rejected": return "var(--critical)";
+      case "relabeled": return "var(--warning)";
+      case "uncertain": return "var(--muted)";
+      default: return "var(--surface-2)";
+    }
+  }
+  function reviewBadgeGlyph(decision) {
+    switch (decision) {
+      case "confirmed": return "✓ confirmed";
+      case "rejected": return "✕ rejected";
+      case "relabeled": return "✎ relabeled";
+      case "uncertain": return "? uncertain";
+      default: return "unreviewed";
+    }
+  }
 
   function init(data) {
     manifest = data;
@@ -424,12 +519,14 @@ button.link-btn {
     const total = manifest.annotations.length;
     const avgScore = total ? manifest.annotations.reduce((s, a) => s + a.score, 0) / total : 0;
     const lowConf = manifest.annotations.filter((a) => a.score < 0.4).length;
+    const reviewedCount = manifest.annotations.filter((a) => a.review).length;
     byId("stat-row").innerHTML = `
       <div class="stat-tile"><div class="value">${manifest.images.length}</div><div class="label">Frames exported</div></div>
       <div class="stat-tile"><div class="value">${total}</div><div class="label">Detections</div></div>
       <div class="stat-tile"><div class="value">${genusOrder.length}</div><div class="label">Genera identified</div></div>
       <div class="stat-tile"><div class="value">${avgScore.toFixed(2)}</div><div class="label">Mean confidence</div></div>
       <div class="stat-tile"><div class="value">${lowConf}</div><div class="label">Below 0.40 confidence</div></div>
+      <div class="stat-tile"><div class="value" id="reviewed-stat-value">${reviewedCount}/${total}</div><div class="label">Reviewed</div></div>
     `;
 
     const barsWrap = byId("genus-bars");
@@ -481,6 +578,10 @@ button.link-btn {
     byId("search-input").addEventListener("input", (e) => { state.search = e.target.value.toLowerCase(); renderGrid(); });
     byId("sort-select").addEventListener("change", (e) => { state.sort = e.target.value; renderGrid(); });
     byId("stereo-select").addEventListener("change", (e) => { state.stereoFilter = e.target.value; renderGrid(); });
+    const reviewerInput = byId("reviewer-input");
+    reviewerInput.value = getSavedReviewer();
+    reviewerInput.addEventListener("input", (e) => { saveReviewer(e.target.value); updateSubmitEnabled(); });
+    byId("review-status-select").addEventListener("change", (e) => { state.reviewStatusFilter = e.target.value; renderGrid(); });
     const slider = byId("min-score");
     slider.addEventListener("input", (e) => {
       state.minScore = parseFloat(e.target.value);
@@ -512,11 +613,69 @@ button.link-btn {
       state.maxScore = null; state.reviewMode = false; slider.disabled = false;
       reviewBtn.textContent = "Flag for review (confidence < 0.40)"; reviewBtn.style.color = "";
       state.stereoFilter = ""; byId("stereo-select").value = "";
+      state.reviewStatusFilter = ""; byId("review-status-select").value = "";
       renderGrid();
     });
     byId("detail-close").addEventListener("click", closeDetail);
     byId("detail-overlay").addEventListener("click", (e) => { if (e.target.id === "detail-overlay") closeDetail(); });
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDetail(); });
+
+    byId("decision-btns").querySelectorAll(".decision-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        selectedDecision = btn.dataset.decision;
+        byId("decision-btns").querySelectorAll(".decision-btn").forEach((b) => b.classList.toggle("active", b === btn));
+        byId("correction-fields").hidden = selectedDecision !== "relabeled";
+        updateSubmitEnabled();
+      });
+    });
+    byId("corrected-genus-input").addEventListener("input", updateSubmitEnabled);
+    byId("submit-review-btn").addEventListener("click", submitReview);
+  }
+
+  function updateSubmitEnabled() {
+    const reviewer = byId("reviewer-input").value.trim();
+    let ok = Boolean(selectedDecision) && Boolean(reviewer);
+    if (selectedDecision === "relabeled" && !byId("corrected-genus-input").value.trim()) ok = false;
+    byId("submit-review-btn").disabled = !ok;
+  }
+
+  function submitReview() {
+    const ann = manifest.annotations.find((a) => a.id === state.selectedAnnotationId);
+    if (!ann) return;
+    const reviewer = byId("reviewer-input").value.trim();
+    saveReviewer(reviewer);
+    const body = {
+      decision: selectedDecision,
+      reviewer,
+      corrected_genus: byId("corrected-genus-input").value.trim() || null,
+      corrected_species: byId("corrected-species-input").value.trim() || null,
+      notes: byId("review-notes-input").value.trim() || null,
+    };
+    const errBox = byId("review-submit-error");
+    errBox.hidden = true;
+    byId("submit-review-btn").disabled = true;
+    fetch(`/detections/${ann.id}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => { throw new Error((d && d.detail) || `HTTP ${r.status}`); });
+        return r.json();
+      })
+      .then((saved) => {
+        ann.review = saved;
+        renderReviewSection(ann);
+        renderGrid();
+        const reviewedCount = manifest.annotations.filter((a) => a.review).length;
+        const statEl = byId("reviewed-stat-value");
+        if (statEl) statEl.textContent = `${reviewedCount}/${manifest.annotations.length}`;
+      })
+      .catch((err) => {
+        errBox.textContent = "Could not save review: " + err.message;
+        errBox.hidden = false;
+        updateSubmitEnabled();
+      });
   }
 
   function matchesFilters(a, image) {
@@ -524,6 +683,14 @@ button.link-btn {
     if (state.maxScore != null && a.score >= state.maxScore) return false;
     if (state.genusFilter.size && !state.genusFilter.has(a.genus)) return false;
     if (state.stereoFilter && image.stereo_side !== state.stereoFilter) return false;
+    if (state.reviewStatusFilter) {
+      const decision = a.review && a.review.decision;
+      if (state.reviewStatusFilter === "unreviewed") {
+        if (decision) return false;
+      } else if (decision !== state.reviewStatusFilter) {
+        return false;
+      }
+    }
     if (state.search) {
       const hay = `${a.genus} ${a.species} ${a.category_name || ""} ${image.file_name}`.toLowerCase();
       if (!hay.includes(state.search)) return false;
@@ -568,6 +735,7 @@ button.link-btn {
             <span class="pill" style="background:${gTier.css}" title="Genus confidence">${a.genus_confidence.toFixed(2)}</span>
             <span class="pill" style="background:${sTier.css}" title="Species confidence">${a.species_confidence.toFixed(2)}</span>
           </div>
+          <div class="review-badge" style="background:${reviewBadgeColor(a.review && a.review.decision)}">${reviewBadgeGlyph(a.review && a.review.decision)}</div>
         </div>
       `;
       card.addEventListener("click", () => openDetail(a.id));
@@ -611,6 +779,7 @@ button.link-btn {
       <div class="detail-field"><div class="k">Stereo crop offset</div><div class="v">${image.stereo_crop_x_offset}px</div></div>
     `;
 
+    renderReviewSection(ann);
     byId("detail-overlay").hidden = false;
   }
 
@@ -634,6 +803,54 @@ button.link-btn {
 
   function closeDetail() {
     byId("detail-overlay").hidden = true;
+  }
+
+  function renderReviewSection(ann) {
+    selectedDecision = null;
+    byId("decision-btns").querySelectorAll(".decision-btn").forEach((b) => b.classList.remove("active"));
+    byId("correction-fields").hidden = true;
+    byId("corrected-genus-input").value = "";
+    byId("corrected-species-input").value = "";
+    byId("review-notes-input").value = "";
+    byId("review-submit-error").hidden = true;
+    updateSubmitEnabled();
+
+    const line = byId("review-status-line");
+    if (ann.review) {
+      const when = new Date(ann.review.reviewed_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      line.innerHTML = `Current verdict: <strong style="color:${reviewBadgeColor(ann.review.decision)}">${reviewBadgeGlyph(ann.review.decision)}</strong> by ${ann.review.reviewer} · ${when}`;
+    } else {
+      line.textContent = "Not yet reviewed.";
+    }
+
+    loadReviewHistory(ann.id);
+  }
+
+  function loadReviewHistory(detectionId) {
+    const histWrap = byId("review-history");
+    histWrap.innerHTML = `<div style="font-size:0.78rem; color:var(--muted);">Loading history…</div>`;
+    fetch(`/detections/${detectionId}/reviews`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        if (state.selectedAnnotationId !== detectionId) return; // user moved to a different detection
+        const reviews = data.reviews || [];
+        if (!reviews.length) {
+          histWrap.innerHTML = `<div style="font-size:0.78rem; color:var(--muted);">No review history yet.</div>`;
+          return;
+        }
+        histWrap.innerHTML = reviews.map((r) => {
+          const when = new Date(r.reviewed_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+          const correction = r.decision === "relabeled" ? ` → ${r.corrected_genus || "?"} ${r.corrected_species || ""}` : "";
+          const note = r.notes ? ` — "${r.notes}"` : "";
+          return `<div class="review-history-item"><strong style="color:${reviewBadgeColor(r.decision)}">${reviewBadgeGlyph(r.decision)}</strong>${correction} · ${r.reviewer} · ${when}${note}</div>`;
+        }).join("");
+      })
+      .catch((err) => {
+        histWrap.innerHTML = `<div style="font-size:0.78rem; color:var(--critical);">Could not load history: ${err.message}</div>`;
+      });
   }
 
   // --- Phase 1 port: load from the live API instead of a static manifest.json ---

@@ -1,13 +1,9 @@
-"""Phase 1 read API for the results-auditor app (see the architecture +
-roadmap doc in the project). Exposes the Phase 0 schema (db/schema.sql)
-over HTTP so the viewer's JS can query a run's detections at request
-time -- filtered and paginated server-side -- instead of fetching an
-entire run's manifest.json into the browser at once. This is the
-addition the static-manifest viewer couldn't do: "large prediction
-datasets" don't all have to come down to the client just to look at a
-filtered slice of one run.
-
-Read-only. Submitting review decisions is Phase 2 (not here yet).
+"""Phase 1/2 API for the results-auditor app (see the architecture +
+roadmap doc in the project). Exposes the schema (db/schema.sql, plus
+migrations/0002_review_history.sql for a DB created before that file
+existed) over HTTP: Phase 1 is read endpoints for the viewer; Phase 2
+(below) is write-back -- submitting a review decision -- plus reading
+review history back out.
 
 Run locally against a local Postgres container (see "Loading a run
 into Postgres" in the README for standing that up and loading data):
@@ -18,21 +14,36 @@ into Postgres" in the README for standing that up and loading data):
 
     curl http://localhost:8000/runs
     curl "http://localhost:8000/runs/1?genus=Leptasterias&min_score=0.5"
+    curl -X POST http://localhost:8000/detections/1/review \
+      -H 'Content-Type: application/json' \
+      -d '{"decision": "confirmed", "reviewer": "jeremy.jenrette@noaa.gov"}'
+    curl http://localhost:8000/detections/1/reviews
 
 `GET /runs/{id}` deliberately returns the SAME top-level shape as the
 `export-viewer-assets` manifest.json (created_at, model_type, images,
-annotations, ...) -- it's meant as a drop-in replacement for
-fetch('manifest.json') in the existing viewer, not a new contract the
-frontend has to learn. The one real difference: `context_thumb` /
-`crop_thumb` point at this API's own /thumb proxy (below) instead of a
-local relative path, since the DB only has the gs:// URI ingest-run
-uploaded them to, and a browser can't load gs:// directly.
+annotations, ...) -- it's a drop-in replacement for fetch('manifest.json')
+in the existing viewer, not a new contract the frontend has to learn.
+Each annotation also carries a `review` field (the current/latest
+verdict, or null if never reviewed) -- see `latest_reviews` in the
+schema. `context_thumb`/`crop_thumb` point at this API's own /thumb
+proxy (below) instead of a local relative path, since the DB only has
+the gs:// URI ingest-run uploaded them to, and a browser can't load
+gs:// directly.
+
+Reviews are a full history, not a single overwritten row (schema
+migration 0002, 2026-10-02): submitting a new review for a detection
+that already has one does NOT overwrite it -- it adds another row.
+`latest_reviews` (most recent `reviewed_at` per detection) is "the
+current verdict"; the full history stays queryable via
+GET /detections/{id}/reviews, e.g. to see two auditors disagree, or
+one auditor changing an earlier call -- a real signal for tracking
+reviewer performance/agreement, not noise to discard.
 """
 from __future__ import annotations
 
 import mimetypes
 import os
-from typing import List, Optional
+from typing import Dict, List, Literal, Optional
 from urllib.parse import quote
 
 from pathlib import Path
@@ -40,13 +51,14 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, field_validator
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
 DSN_ENV_VAR = "PEMAD_DB_DSN"
 DEFAULT_DSN = "postgresql://postgres:postgres@localhost:5432/viewer_dev"
 
-app = FastAPI(title="PEMAD Results Auditor API", version="0.1.0")
+app = FastAPI(title="PEMAD Results Auditor API", version="0.2.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -55,7 +67,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -80,6 +92,19 @@ def run_query(sql: str, params: tuple = ()) -> List[dict]:
         get_pool().putconn(conn)
 
 
+def run_insert_returning(sql: str, params: dict) -> dict:
+    """Like run_query, but for a single-row INSERT ... RETURNING *,
+    committing the transaction (run_query's `with conn` already commits
+    on success / rolls back on exception, same as here)."""
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return dict(cur.fetchone())
+    finally:
+        get_pool().putconn(conn)
+
+
 def thumb_proxy_url(gs_uri: Optional[str]) -> Optional[str]:
     """Rewrite a stored gs:// thumbnail URI into a same-origin URL this
     API can actually serve to a browser (see /thumb below). None stays
@@ -93,10 +118,9 @@ def thumb_proxy_url(gs_uri: Optional[str]) -> Optional[str]:
 
 @app.get("/", include_in_schema=False)
 def viewer():
-    """Serves the Phase 1 viewer (static/viewer.html) -- the ported
-    version of the claude.ai Artifact prototype, pointed at this API
-    instead of a static manifest.json. Same-origin by construction, so
-    its fetch('/runs/...') calls need no CORS configuration."""
+    """Serves the ported viewer (static/viewer.html), pointed at this
+    API instead of a static manifest.json. Same-origin by construction,
+    so its fetch('/runs/...') calls need no CORS configuration."""
     return FileResponse(STATIC_DIR / "viewer.html")
 
 
@@ -111,7 +135,7 @@ def get_thumb(uri: str = Query(..., description="A gs:// URI previously stored b
     output bucket -- this is a proxy for exactly the thumbnails
     ingest-run itself uploaded, not an open fetch-any-gs-object
     endpoint. No caching/CDN here; fine for a few dozen/hundred
-    thumbnails in Phase 1 dev, not meant to survive past it unchanged."""
+    thumbnails in Phase 1/2 dev, not meant to survive past it unchanged."""
     from . import config, gcs  # deferred: keeps api.py importable without google-cloud-storage installed
 
     if not uri.startswith(f"gs://{config.OUTPUT_BUCKET}/"):
@@ -138,6 +162,21 @@ def list_runs():
     return {"runs": rows}
 
 
+def _latest_reviews_by_detection(detection_ids: List[int]) -> Dict[int, dict]:
+    if not detection_ids:
+        return {}
+    rows = run_query(
+        """
+        SELECT detection_id, decision, corrected_genus, corrected_species, notes,
+               reviewer, reviewed_at
+        FROM latest_reviews
+        WHERE detection_id = ANY(%s)
+        """,
+        (detection_ids,),
+    )
+    return {r["detection_id"]: r for r in rows}
+
+
 @app.get("/runs/{run_id}")
 def get_run(
     run_id: int,
@@ -152,7 +191,8 @@ def get_run(
     Filters apply only to `annotations`; `images` is always returned in
     full for the run, since the detail panel needs every detection's
     sibling frame regardless of which detections are currently filtered
-    in."""
+    in. Each annotation carries `review`: the current (latest) verdict
+    for that detection, or null if it's never been reviewed."""
     run_rows = run_query("SELECT * FROM runs WHERE id = %s", (run_id,))
     if not run_rows:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
@@ -209,6 +249,7 @@ def get_run(
         """,
         tuple(params),
     )
+    reviews_by_detection = _latest_reviews_by_detection([d["id"] for d in det_rows])
     annotations = [
         {
             "id": d["id"],
@@ -222,6 +263,7 @@ def get_run(
             "species": d["species"],
             "species_confidence": d["species_confidence"],
             "crop_thumb": thumb_proxy_url(d["crop_thumb_uri"]),
+            "review": reviews_by_detection.get(d["id"]),
         }
         for d in det_rows
     ]
@@ -237,3 +279,77 @@ def get_run(
         "images": images,
         "annotations": annotations,
     }
+
+
+# --- Phase 2: write-back -----------------------------------------------
+
+DECISIONS = ("confirmed", "rejected", "relabeled", "uncertain")
+
+
+class ReviewIn(BaseModel):
+    decision: Literal["confirmed", "rejected", "relabeled", "uncertain"]
+    reviewer: str
+    corrected_genus: Optional[str] = None
+    corrected_species: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("reviewer")
+    @classmethod
+    def reviewer_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("reviewer must not be blank")
+        return v
+
+    @field_validator("corrected_genus", "corrected_species")
+    @classmethod
+    def blank_to_none(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() or None if v is not None else None
+
+
+@app.post("/detections/{detection_id}/review", status_code=201)
+def submit_review(detection_id: int, review: ReviewIn):
+    """Adds a new review row for this detection -- never overwrites a
+    previous one (see module docstring: reviews are a full history).
+    `latest_reviews`/the `review` field on GET /runs/{id} picks up this
+    row automatically on the next read, since "latest" is just an
+    ORDER BY reviewed_at DESC on the whole table."""
+    exists = run_query("SELECT 1 FROM detections WHERE id = %s", (detection_id,))
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"detection {detection_id} not found")
+
+    if review.decision == "relabeled" and not review.corrected_genus:
+        raise HTTPException(
+            status_code=400,
+            detail="corrected_genus is required when decision is 'relabeled'",
+        )
+
+    row = run_insert_returning(
+        """
+        INSERT INTO reviews (detection_id, decision, corrected_genus, corrected_species, notes, reviewer)
+        VALUES (%(detection_id)s, %(decision)s, %(corrected_genus)s, %(corrected_species)s, %(notes)s, %(reviewer)s)
+        RETURNING id, detection_id, decision, corrected_genus, corrected_species, notes, reviewer, reviewed_at
+        """,
+        {"detection_id": detection_id, **review.model_dump()},
+    )
+    return row
+
+
+@app.get("/detections/{detection_id}/reviews")
+def get_review_history(detection_id: int):
+    """Full review history for one detection, newest first -- the first
+    entry is the current verdict (same row latest_reviews would give)."""
+    exists = run_query("SELECT 1 FROM detections WHERE id = %s", (detection_id,))
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"detection {detection_id} not found")
+
+    rows = run_query(
+        """
+        SELECT id, decision, corrected_genus, corrected_species, notes, reviewer, reviewed_at
+        FROM reviews
+        WHERE detection_id = %s
+        ORDER BY reviewed_at DESC, id DESC
+        """,
+        (detection_id,),
+    )
+    return {"detection_id": detection_id, "reviews": rows}
