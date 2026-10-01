@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 db = ["psycopg2-binary>=2.9"]
+api = ["psycopg2-binary>=2.9", "fastapi>=0.110", "uvicorn[standard]>=0.29"]
 
 [project.scripts]
 pemad-infer = "pemad_esb_inference.cli:main"

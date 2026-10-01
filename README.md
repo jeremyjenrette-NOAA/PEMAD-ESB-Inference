@@ -359,6 +359,33 @@ inspecting the schema/ingestion locally before GCS hosting is wired up.
 `runs.run_card_uri` is `UNIQUE` -- `ingest-run` is meant to be run once
 per export, not repeatedly on the same run.
 
+### Running the Phase 1 read API locally
+
+`src/pemad_esb_inference/api.py` is a FastAPI service exposing the
+schema above over HTTP, read-only for now (write-back/review endpoints
+are Phase 2). It's a drop-in data source for the viewer -- `GET
+/runs/{id}` returns the same {run, images, annotations} shape the
+viewer's manifest.json already has, filtered/paginated server-side
+instead of shipping an entire run to the browser.
+
+```bash
+pip install -e ".[db,api]"
+export PEMAD_DB_DSN="postgresql://postgres:postgres@localhost:5432/viewer_dev"
+uvicorn pemad_esb_inference.api:app --reload --port 8000
+```
+
+```bash
+curl http://localhost:8000/runs
+curl "http://localhost:8000/runs/1?genus=Leptasterias&min_score=0.5"
+```
+
+`PEMAD_DB_DSN` defaults to the local container above if unset. Known
+gap: `context_thumb_uri`/`crop_thumb_uri` come back as raw `gs://`
+paths once a run was ingested without `--skip-upload` -- a browser
+can't load those directly yet; resolving them to viewable URLs is a
+near-term follow-up, not yet decided (signed URLs vs. a read-access
+bucket policy).
+
 ## Layout
 
 - `src/pemad_esb_inference/` -- the package
@@ -372,6 +399,7 @@ per export, not repeatedly on the same run.
   - `run_card.py` -- builds and uploads a pre-flight provenance "run card" for a trigger
   - `viewer_export.py` -- re-derives per-detection crop thumbnails + a `manifest.json` from a completed run's run card (see "Results viewer assets" above)
   - `db_ingest.py` -- loads a `viewer_export.py` export into Postgres for the results-auditor app (see "Loading a run into Postgres" above, and `db/schema.sql`)
+  - `api.py` -- Phase 1 read-only FastAPI service over the same schema (see "Running the Phase 1 read API locally" above)
   - `gcs.py` -- small google-cloud-storage wrappers (upload/download text+bytes/list/exists/delete)
   - `airflow_client.py` -- triggers/queries the DAG via `gcloud composer environments run`
   - `batch_monitor.py` -- resolves and polls the resulting Cloud Batch job
