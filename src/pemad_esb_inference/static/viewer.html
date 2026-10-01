@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star-Cascade Results Viewer</title>
+<style>
+/*
+  Layout concept: a fixed control rail (search + genus filter chips built
+  from a live bar chart + confidence slider) above a responsive detection
+  grid; selecting a card opens a detail panel that overlays every bbox in
+  that source frame, so duplicate/overlapping detections are visible at a
+  glance -- the exact failure mode this pipeline had before the stereo fix.
+
+  Served directly by api.py (GET /) -- same origin as /runs and /thumb,
+  so the fetches below are plain relative paths, no CORS involved. This
+  is the Phase 1 "ported" viewer: same render/filter/chart logic as the
+  claude.ai Artifact prototype, pointed at the live API instead of a
+  static manifest.json. The Artifact itself is left as a frozen UI demo
+  -- a published Artifact page can't reach a private API like this one,
+  so it was never going to be the live tool.
+*/
+:root {
+  color-scheme: light;
+  --page:        #f9f9f7;
+  --surface:     #fcfcfb;
+  --surface-2:   #f3f2ee;
+  --text:        #0b0b0b;
+  --text-2:      #52514e;
+  --muted:       #898781;
+  --border:      rgba(11,11,11,0.10);
+  --accent:      #2a78d6;
+  --accent-ink:  #ffffff;
+  --good:        #0ca30c;
+  --warning:     #fab219;
+  --critical:    #d03b3b;
+  --cat-1: #2a78d6; --cat-2: #eb6834; --cat-3: #1baf7a; --cat-4: #eda100;
+  --cat-5: #e87ba4; --cat-6: #008300; --cat-7: #4a3aa7; --cat-8: #e34948;
+  --seq-100: #cde2fb; --seq-250: #86b6ef; --seq-400: #3987e5; --seq-550: #1c5cab;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --surface-2:   #232321;
+    --text:        #ffffff;
+    --text-2:      #c3c2b7;
+    --muted:       #898781;
+    --border:      rgba(255,255,255,0.10);
+    --accent:      #3987e5;
+    --accent-ink:  #ffffff;
+    --good:        #0ca30c;
+    --warning:     #fab219;
+    --critical:    #e66767;
+    --cat-1: #3987e5; --cat-2: #d95926; --cat-3: #199e70; --cat-4: #c98500;
+    --cat-5: #d55181; --cat-6: #008300; --cat-7: #9085e9; --cat-8: #e66767;
+    --seq-100: #184f95; --seq-250: #1c5cab; --seq-400: #3987e5; --seq-550: #86b6ef;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page:        #0d0d0d;
+  --surface:     #1a1a19;
+  --surface-2:   #232321;
+  --text:        #ffffff;
+  --text-2:      #c3c2b7;
+  --muted:       #898781;
+  --border:      rgba(255,255,255,0.10);
+  --accent:      #3987e5;
+  --accent-ink:  #ffffff;
+  --good:        #0ca30c;
+  --warning:     #fab219;
+  --critical:    #e66767;
+  --cat-1: #3987e5; --cat-2: #d95926; --cat-3: #199e70; --cat-4: #c98500;
+  --cat-5: #d55181; --cat-6: #008300; --cat-7: #9085e9; --cat-8: #e66767;
+  --seq-100: #184f95; --seq-250: #1c5cab; --seq-400: #3987e5; --seq-550: #86b6ef;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--page);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding-inline: 16px;
+  padding-block: 20px 48px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+img { max-width: 100%; display: block; }
+
+.masthead {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 4px;
+}
+.masthead h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.01em; }
+.masthead .meta { color: var(--text-2); font-size: 0.85rem; }
+.example-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--warning); color: #1a1500; font-weight: 600;
+  font-size: 0.72rem; letter-spacing: 0.02em; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+}
+.subhead { color: var(--text-2); font-size: 0.92rem; margin-top: 2px; margin-bottom: 20px; }
+
+.panel {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 16px; margin-bottom: 16px;
+}
+.panel h2 {
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); font-weight: 600; margin-bottom: 12px;
+}
+
+.controls-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 14px; }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field label { font-size: 0.72rem; color: var(--muted); font-weight: 600; letter-spacing: 0.02em; }
+input[type="search"], select {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 0.88rem; font-family: inherit;
+}
+input[type="search"] { width: 220px; }
+input[type="range"] { width: 160px; accent-color: var(--accent); }
+.slider-value { font-variant-numeric: tabular-nums; font-size: 0.82rem; color: var(--text-2); min-width: 2.6em; }
+.slider-row { display: flex; align-items: center; gap: 8px; }
+
+button.chip {
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  border-radius: 999px; padding: 6px 12px; font-size: 0.82rem; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; font-family: inherit;
+  transition: background 0.12s, border-color 0.12s;
+}
+button.chip:hover { border-color: var(--accent); }
+button.chip[aria-pressed="true"] {
+  background: color-mix(in oklab, var(--accent) 16%, var(--surface-2));
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.chip-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.quick-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+button.link-btn {
+  background: none; border: none; color: var(--accent); font-size: 0.82rem;
+  cursor: pointer; padding: 4px 0; font-family: inherit; text-decoration: underline;
+}
+
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 4px; }
+.stat-tile { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; }
+.stat-tile .value { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat-tile .label { font-size: 0.74rem; color: var(--muted); margin-top: 2px; }
+
+.chart-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 24px; }
+@media (max-width: 720px) { .chart-grid { grid-template-columns: 1fr; } }
+
+.bar-row { display: grid; grid-template-columns: 96px 1fr 3.6em; align-items: center; gap: 8px; margin-bottom: 7px; }
+.bar-row button {
+  all: unset; display: contents; cursor: pointer;
+}
+.bar-label { font-size: 0.82rem; color: var(--text); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { background: var(--surface-2); border-radius: 5px; height: 16px; position: relative; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 5px; transition: filter 0.12s; }
+.bar-row:hover .bar-fill { filter: brightness(1.1); }
+.bar-count { font-size: 0.78rem; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+.hist { display: flex; align-items: flex-end; gap: 4px; height: 92px; }
+.hist-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; justify-content: flex-end; height: 100%; }
+.hist-bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; }
+.hist-tick { font-size: 0.66rem; color: var(--muted); }
+
+.results-meta { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; color: var(--text-2); font-size: 0.85rem; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 12px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; cursor: pointer; text-align: left; font-family: inherit;
+  padding: 0; display: flex; flex-direction: column;
+  transition: border-color 0.12s, transform 0.1s;
+}
+.card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card .thumb-wrap { aspect-ratio: 4 / 3; background: var(--surface-2); overflow: hidden; }
+.card .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.card .card-body { padding: 8px 10px 10px; }
+.card .taxon { font-size: 0.88rem; }
+.card .taxon .genus { font-weight: 700; }
+.card .taxon .species { font-style: italic; color: var(--text-2); }
+.card .pills { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
+.pill {
+  font-size: 0.68rem; font-weight: 700; border-radius: 5px; padding: 2px 6px;
+  font-variant-numeric: tabular-nums; color: #0b0b0b;
+}
+.empty-state { text-align: center; color: var(--muted); padding: 40px 12px; font-size: 0.92rem; }
+
+.detail-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 20;
+  display: flex; justify-content: flex-end;
+}
+.detail-panel {
+  background: var(--page); width: min(480px, 100%); height: 100%; overflow-y: auto;
+  padding: 18px 18px calc(24px + env(safe-area-inset-bottom, 0px));
+  border-left: 1px solid var(--border);
+}
+.detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.detail-close {
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; width: 32px; height: 32px; font-size: 1rem; cursor: pointer; flex: none;
+}
+.frame-wrap { position: relative; border-radius: 10px; overflow: hidden; background: var(--surface-2); margin-bottom: 14px; }
+.bbox-mark {
+  position: absolute; border: 2px solid var(--muted); border-radius: 2px;
+  cursor: pointer; background: rgba(0,0,0,0);
+}
+.bbox-mark.active { border-color: var(--accent); border-width: 3px; box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 35%, transparent); }
+.detail-crop { border-radius: 10px; overflow: hidden; margin-bottom: 14px; max-width: 220px; }
+.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-bottom: 16px; }
+.detail-field .k { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.detail-field .v { font-size: 0.95rem; margin-top: 2px; }
+.frame-siblings { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.sibling-thumb { width: 52px; height: 52px; border-radius: 6px; overflow: hidden; border: 2px solid transparent; cursor: pointer; }
+.sibling-thumb.active { border-color: var(--accent); }
+.sibling-thumb img { width: 100%; height: 100%; object-fit: cover; }
+
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <h1 id="page-title">Star-Cascade Results Viewer</h1>
+  <span class="example-badge" id="example-badge" hidden>Example data</span>
+</div>
+<div class="subhead" id="run-meta">Loading run…</div>
+
+<div class="panel">
+  <h2>Filter &amp; search</h2>
+  <div class="controls-row">
+    <div class="field">
+      <label for="search-input">Search taxon / frame</label>
+      <input type="search" id="search-input" placeholder="e.g. Leptasterias, tenera, frame name…">
+    </div>
+    <div class="field">
+      <label for="sort-select">Sort by</label>
+      <select id="sort-select">
+        <option value="score-desc">Confidence: high → low</option>
+        <option value="score-asc">Confidence: low → high</option>
+        <option value="genus">Genus (A–Z)</option>
+        <option value="image">Source frame</option>
+      </select>
+    </div>
+    <div class="field" id="stereo-field" hidden>
+      <label for="stereo-select">Stereo side</label>
+      <select id="stereo-select">
+        <option value="">Both eyes</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="min-score">Min. detection confidence</label>
+      <div class="slider-row">
+        <input type="range" id="min-score" min="0" max="1" step="0.01" value="0">
+        <span class="slider-value" id="min-score-value">0.00</span>
+      </div>
+    </div>
+  </div>
+  <div class="quick-actions">
+    <span style="font-size:0.82rem; color:var(--muted);">Genus:</span>
+    <div class="chip-row" id="genus-chips"></div>
+  </div>
+  <div class="quick-actions" style="margin-top:8px;">
+    <button class="link-btn" id="needs-review-btn">Flag for review (confidence &lt; 0.40)</button>
+    <button class="link-btn" id="clear-filters-btn">Clear all filters</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Overview</h2>
+  <div class="stat-row" id="stat-row"></div>
+  <div class="chart-grid" style="margin-top:16px;">
+    <div>
+      <div style="font-size:0.78rem; color:var(--muted); margin-bottom:8px;">Detections by genus (click to filter)</div>
+      <div id="genus-bars"></div>
+    </div>
+    <div>
+      <div style="font-size:0.78rem; color:var(--muted); margin-bottom:8px;">Detection confidence distribution</div>
+      <div class="hist" id="score-hist"></div>
+    </div>
+  </div>
+</div>
+
+<div class="results-meta">
+  <span id="results-count">—</span>
+  <span id="skipped-note"></span>
+</div>
+<div class="grid" id="results-grid"></div>
+<div class="empty-state" id="empty-state" hidden>No detections match these filters.</div>
+
+<div class="detail-overlay" id="detail-overlay" hidden>
+  <div class="detail-panel" role="dialog" aria-modal="true" aria-label="Detection detail">
+    <div class="detail-head">
+      <div>
+        <h3 id="detail-taxon">—</h3>
+        <div style="color:var(--text-2); font-size:0.85rem;" id="detail-file">—</div>
+      </div>
+      <button class="detail-close" id="detail-close" aria-label="Close">✕</button>
+    </div>
+    <div class="frame-wrap" id="frame-wrap">
+      <img id="frame-img" alt="Source frame">
+    </div>
+    <div style="font-size:0.78rem; color:var(--muted); margin-bottom:14px;">
+      Other detections in this frame (click a box or thumbnail to switch):
+      <div class="frame-siblings" id="frame-siblings"></div>
+    </div>
+    <div class="detail-crop"><img id="detail-crop-img" alt="Detection crop"></div>
+    <div class="detail-grid" id="detail-grid"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const CAT_COLORS = ["--cat-1","--cat-2","--cat-3","--cat-4","--cat-5","--cat-6","--cat-7","--cat-8"];
+  const root = getComputedStyle(document.documentElement);
+  const cssVar = (name) => root.getPropertyValue(name).trim() || getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  const state = {
+    search: "",
+    genusFilter: new Set(),
+    minScore: 0,
+    maxScore: null,
+    reviewMode: false,
+    stereoFilter: "",
+    sort: "score-desc",
+    selectedAnnotationId: null,
+  };
+
+  let manifest = null;
+  let genusColor = {};
+  let genusOrder = [];
+
+  function colorFor(genus) {
+    return "var(" + (genusColor[genus] || "--muted") + ")";
+  }
+
+  function confidenceTier(score) {
+    if (score >= 0.7) return { css: "var(--good)", label: "good" };
+    if (score >= 0.3) return { css: "var(--warning)", label: "moderate" };
+    return { css: "var(--critical)", label: "low" };
+  }
+
+  function byId(id) { return document.getElementById(id); }
+
+  function init(data) {
+    manifest = data;
+    const imagesById = new Map(manifest.images.map((im) => [im.id, im]));
+    manifest._imagesById = imagesById;
+    manifest._annotationsByImage = new Map();
+    manifest.annotations.forEach((a) => {
+      if (!manifest._annotationsByImage.has(a.image_id)) manifest._annotationsByImage.set(a.image_id, []);
+      manifest._annotationsByImage.get(a.image_id).push(a);
+    });
+
+    const genusCounts = new Map();
+    manifest.annotations.forEach((a) => genusCounts.set(a.genus, (genusCounts.get(a.genus) || 0) + 1));
+    genusOrder = [...genusCounts.keys()].sort((a, b) => genusCounts.get(b) - genusCounts.get(a));
+    genusOrder.forEach((g, i) => { genusColor[g] = CAT_COLORS[i % CAT_COLORS.length]; });
+
+    renderMasthead();
+    renderGenusChips(genusCounts);
+    renderStereoFilter();
+    renderOverview(genusCounts);
+    wireControls();
+    renderGrid();
+  }
+
+  function renderMasthead() {
+    byId("example-badge").hidden = !manifest.example_data;
+    const created = manifest.created_at ? new Date(manifest.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "unknown time";
+    byId("run-meta").textContent =
+      `${manifest.model_type || "model"} · run recorded ${created} · ` +
+      `${manifest.images.length} frame(s) · ${manifest.annotations.length} detection(s)`;
+    if (manifest.skipped_images && manifest.skipped_images.length) {
+      byId("skipped-note").textContent = `${manifest.skipped_images.length} source image(s) had no matching input path and were skipped from this export.`;
+    }
+  }
+
+  function renderGenusChips(genusCounts) {
+    const wrap = byId("genus-chips");
+    wrap.innerHTML = "";
+    genusOrder.forEach((genus) => {
+      const btn = document.createElement("button");
+      btn.className = "chip";
+      btn.type = "button";
+      btn.setAttribute("aria-pressed", "false");
+      btn.innerHTML = `<span class="chip-dot" style="background:${colorFor(genus)}"></span>${genus} (${genusCounts.get(genus)})`;
+      btn.addEventListener("click", () => {
+        if (state.genusFilter.has(genus)) state.genusFilter.delete(genus);
+        else state.genusFilter.add(genus);
+        syncGenusChips();
+        renderGrid();
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
+  function syncGenusChips() {
+    byId("genus-chips").querySelectorAll("button").forEach((btn, i) => {
+      btn.setAttribute("aria-pressed", String(state.genusFilter.has(genusOrder[i])));
+    });
+  }
+
+  function renderStereoFilter() {
+    const sides = new Set(manifest.images.map((im) => im.stereo_side).filter(Boolean));
+    if (sides.size <= 1) return;
+    byId("stereo-field").hidden = false;
+    const select = byId("stereo-select");
+    [...sides].sort().forEach((side) => {
+      const opt = document.createElement("option");
+      opt.value = side; opt.textContent = side === "full" ? "Full (unsplit) frame" : (side.charAt(0).toUpperCase() + side.slice(1) + " eye");
+      select.appendChild(opt);
+    });
+  }
+
+  function renderOverview(genusCounts) {
+    const total = manifest.annotations.length;
+    const avgScore = total ? manifest.annotations.reduce((s, a) => s + a.score, 0) / total : 0;
+    const lowConf = manifest.annotations.filter((a) => a.score < 0.4).length;
+    byId("stat-row").innerHTML = `
+      <div class="stat-tile"><div class="value">${manifest.images.length}</div><div class="label">Frames exported</div></div>
+      <div class="stat-tile"><div class="value">${total}</div><div class="label">Detections</div></div>
+      <div class="stat-tile"><div class="value">${genusOrder.length}</div><div class="label">Genera identified</div></div>
+      <div class="stat-tile"><div class="value">${avgScore.toFixed(2)}</div><div class="label">Mean confidence</div></div>
+      <div class="stat-tile"><div class="value">${lowConf}</div><div class="label">Below 0.40 confidence</div></div>
+    `;
+
+    const barsWrap = byId("genus-bars");
+    barsWrap.innerHTML = "";
+    const maxCount = Math.max(...genusOrder.map((g) => genusCounts.get(g)));
+    genusOrder.forEach((genus) => {
+      const count = genusCounts.get(genus);
+      const row = document.createElement("div");
+      row.className = "bar-row";
+      const pct = (count / maxCount) * 100;
+      row.innerHTML = `
+        <button type="button" class="bar-label" title="Filter to ${genus}">${genus}</button>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${colorFor(genus)}"></div></div>
+        <div class="bar-count">${count}</div>
+      `;
+      row.querySelector("button").addEventListener("click", () => {
+        if (state.genusFilter.has(genus)) state.genusFilter.delete(genus);
+        else state.genusFilter.add(genus);
+        syncGenusChips();
+        renderGrid();
+      });
+      barsWrap.appendChild(row);
+    });
+
+    const bins = [0, 0.2, 0.4, 0.6, 0.8, 1.001];
+    const counts = new Array(bins.length - 1).fill(0);
+    manifest.annotations.forEach((a) => {
+      for (let i = 0; i < bins.length - 1; i++) {
+        if (a.score >= bins[i] && a.score < bins[i + 1]) { counts[i]++; break; }
+      }
+    });
+    const maxBin = Math.max(1, ...counts);
+    const histWrap = byId("score-hist");
+    histWrap.innerHTML = "";
+    counts.forEach((c, i) => {
+      const col = document.createElement("div");
+      col.className = "hist-col";
+      const h = Math.max(2, (c / maxBin) * 72);
+      col.innerHTML = `
+        <div style="font-size:0.7rem; color:var(--text-2); font-variant-numeric: tabular-nums;">${c}</div>
+        <div class="hist-bar" style="height:${h}px; background:var(--seq-400);"></div>
+        <div class="hist-tick">${bins[i].toFixed(1)}–${Math.min(1, bins[i+1]).toFixed(1)}</div>
+      `;
+      histWrap.appendChild(col);
+    });
+  }
+
+  function wireControls() {
+    byId("search-input").addEventListener("input", (e) => { state.search = e.target.value.toLowerCase(); renderGrid(); });
+    byId("sort-select").addEventListener("change", (e) => { state.sort = e.target.value; renderGrid(); });
+    byId("stereo-select").addEventListener("change", (e) => { state.stereoFilter = e.target.value; renderGrid(); });
+    const slider = byId("min-score");
+    slider.addEventListener("input", (e) => {
+      state.minScore = parseFloat(e.target.value);
+      byId("min-score-value").textContent = state.minScore.toFixed(2);
+      renderGrid();
+    });
+    const reviewBtn = byId("needs-review-btn");
+    reviewBtn.addEventListener("click", () => {
+      state.reviewMode = !state.reviewMode;
+      if (state.reviewMode) {
+        state.maxScore = 0.4;
+        state.minScore = 0; slider.value = "0"; byId("min-score-value").textContent = "0.00";
+        slider.disabled = true;
+        state.sort = "score-asc"; byId("sort-select").value = "score-asc";
+        reviewBtn.textContent = "✓ Reviewing low-confidence detections (< 0.40) — click to exit";
+        reviewBtn.style.color = "var(--critical)";
+      } else {
+        state.maxScore = null;
+        slider.disabled = false;
+        reviewBtn.textContent = "Flag for review (confidence < 0.40)";
+        reviewBtn.style.color = "";
+      }
+      renderGrid();
+    });
+    byId("clear-filters-btn").addEventListener("click", () => {
+      state.search = ""; byId("search-input").value = "";
+      state.genusFilter.clear(); syncGenusChips();
+      state.minScore = 0; slider.value = "0"; byId("min-score-value").textContent = "0.00";
+      state.maxScore = null; state.reviewMode = false; slider.disabled = false;
+      reviewBtn.textContent = "Flag for review (confidence < 0.40)"; reviewBtn.style.color = "";
+      state.stereoFilter = ""; byId("stereo-select").value = "";
+      renderGrid();
+    });
+    byId("detail-close").addEventListener("click", closeDetail);
+    byId("detail-overlay").addEventListener("click", (e) => { if (e.target.id === "detail-overlay") closeDetail(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDetail(); });
+  }
+
+  function matchesFilters(a, image) {
+    if (a.score < state.minScore) return false;
+    if (state.maxScore != null && a.score >= state.maxScore) return false;
+    if (state.genusFilter.size && !state.genusFilter.has(a.genus)) return false;
+    if (state.stereoFilter && image.stereo_side !== state.stereoFilter) return false;
+    if (state.search) {
+      const hay = `${a.genus} ${a.species} ${a.category_name || ""} ${image.file_name}`.toLowerCase();
+      if (!hay.includes(state.search)) return false;
+    }
+    return true;
+  }
+
+  function sortAnnotations(list) {
+    const byImage = manifest._imagesById;
+    const sorted = [...list];
+    switch (state.sort) {
+      case "score-asc": sorted.sort((a, b) => a.score - b.score); break;
+      case "genus": sorted.sort((a, b) => a.genus.localeCompare(b.genus) || (b.score - a.score)); break;
+      case "image": sorted.sort((a, b) => (byImage.get(a.image_id).file_name).localeCompare(byImage.get(b.image_id).file_name)); break;
+      default: sorted.sort((a, b) => b.score - a.score);
+    }
+    return sorted;
+  }
+
+  function renderGrid() {
+    const imagesById = manifest._imagesById;
+    const filtered = sortAnnotations(manifest.annotations.filter((a) => matchesFilters(a, imagesById.get(a.image_id))));
+
+    byId("results-count").textContent = `Showing ${filtered.length} of ${manifest.annotations.length} detections`;
+    const grid = byId("results-grid");
+    grid.innerHTML = "";
+    byId("empty-state").hidden = filtered.length !== 0;
+
+    filtered.forEach((a) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "card";
+      const tier = confidenceTier(a.score);
+      const gTier = confidenceTier(a.genus_confidence);
+      const sTier = confidenceTier(a.species_confidence);
+      card.innerHTML = `
+        <div class="thumb-wrap"><img loading="lazy" src="${a.crop_thumb}" alt="${a.genus} ${a.species} detection crop"></div>
+        <div class="card-body">
+          <div class="taxon"><span class="genus" style="color:${colorFor(a.genus)}">${a.genus}</span> <span class="species">${a.species}</span></div>
+          <div class="pills">
+            <span class="pill" style="background:${tier.css}" title="Detection confidence">${a.score.toFixed(2)}</span>
+            <span class="pill" style="background:${gTier.css}" title="Genus confidence">${a.genus_confidence.toFixed(2)}</span>
+            <span class="pill" style="background:${sTier.css}" title="Species confidence">${a.species_confidence.toFixed(2)}</span>
+          </div>
+        </div>
+      `;
+      card.addEventListener("click", () => openDetail(a.id));
+      grid.appendChild(card);
+    });
+  }
+
+  function openDetail(annotationId) {
+    const ann = manifest.annotations.find((a) => a.id === annotationId);
+    const image = manifest._imagesById.get(ann.image_id);
+    state.selectedAnnotationId = annotationId;
+
+    byId("detail-taxon").innerHTML = `<span style="color:${colorFor(ann.genus)}">${ann.genus}</span> <em style="color:var(--text-2)">${ann.species}</em>`;
+    byId("detail-file").textContent = `${image.file_name} · ${image.stereo_side} eye · ${image.width}×${image.height}px`;
+
+    const frameImg = byId("frame-img");
+    frameImg.src = image.context_thumb;
+    frameImg.onload = () => renderBboxMarks(image, annotationId);
+    renderBboxMarks(image, annotationId);
+
+    const siblings = manifest._annotationsByImage.get(image.id) || [];
+    const sibWrap = byId("frame-siblings");
+    sibWrap.innerHTML = "";
+    siblings.forEach((s) => {
+      const t = document.createElement("div");
+      t.className = "sibling-thumb" + (s.id === annotationId ? " active" : "");
+      t.innerHTML = `<img src="${s.crop_thumb}" alt="${s.genus} ${s.species}">`;
+      t.title = `${s.genus} ${s.species} (${s.score.toFixed(2)})`;
+      t.addEventListener("click", () => openDetail(s.id));
+      sibWrap.appendChild(t);
+    });
+
+    byId("detail-crop-img").src = ann.crop_thumb;
+
+    byId("detail-grid").innerHTML = `
+      <div class="detail-field"><div class="k">Detection score</div><div class="v">${ann.score.toFixed(3)}</div></div>
+      <div class="detail-field"><div class="k">Category (raw)</div><div class="v">${ann.category_name || "—"}</div></div>
+      <div class="detail-field"><div class="k">Genus confidence</div><div class="v">${ann.genus_confidence.toFixed(3)}</div></div>
+      <div class="detail-field"><div class="k">Species confidence</div><div class="v">${ann.species_confidence.toFixed(3)}</div></div>
+      <div class="detail-field"><div class="k">Bbox (x, y, w, h)</div><div class="v" style="font-variant-numeric: tabular-nums;">${ann.bbox.map((n) => Math.round(n)).join(", ")}</div></div>
+      <div class="detail-field"><div class="k">Stereo crop offset</div><div class="v">${image.stereo_crop_x_offset}px</div></div>
+    `;
+
+    byId("detail-overlay").hidden = false;
+  }
+
+  function renderBboxMarks(image, activeId) {
+    const frameWrap = byId("frame-wrap");
+    frameWrap.querySelectorAll(".bbox-mark").forEach((el) => el.remove());
+    const siblings = manifest._annotationsByImage.get(image.id) || [];
+    siblings.forEach((s) => {
+      const [x, y, w, h] = s.bbox;
+      const mark = document.createElement("div");
+      mark.className = "bbox-mark" + (s.id === activeId ? " active" : "");
+      mark.style.left = (x / image.width * 100) + "%";
+      mark.style.top = (y / image.height * 100) + "%";
+      mark.style.width = (w / image.width * 100) + "%";
+      mark.style.height = (h / image.height * 100) + "%";
+      mark.title = `${s.genus} ${s.species} (${s.score.toFixed(2)})`;
+      mark.addEventListener("click", (e) => { e.stopPropagation(); openDetail(s.id); });
+      frameWrap.appendChild(mark);
+    });
+  }
+
+  function closeDetail() {
+    byId("detail-overlay").hidden = true;
+  }
+
+  // --- Phase 1 port: load from the live API instead of a static manifest.json ---
+  // Same origin as this page (served by api.py's GET /), so these are plain
+  // relative fetches -- no CORS, no base-URL configuration needed.
+  function currentRunIdFromQuery() {
+    const params = new URLSearchParams(location.search);
+    const id = params.get("run");
+    return id ? parseInt(id, 10) : null;
+  }
+
+  function loadRun(runId) {
+    return fetch(`/runs/${runId}`).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status} loading run ${runId}`);
+      return r.json();
+    });
+  }
+
+  const requestedRun = currentRunIdFromQuery();
+  (requestedRun
+    ? Promise.resolve(requestedRun)
+    : fetch("/runs").then((r) => r.json()).then((d) => {
+        if (!d.runs.length) throw new Error("no runs ingested yet -- run `pemad-infer ingest-run` first");
+        return d.runs[0].id; // most recently ingested, per /runs' own ordering
+      })
+  ).then(loadRun).then(init).catch((err) => {
+    byId("run-meta").textContent = "Could not load run data: " + err.message;
+  });
+})();
+</script>
+</body>
+</html>

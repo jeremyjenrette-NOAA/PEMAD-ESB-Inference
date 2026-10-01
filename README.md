@@ -379,12 +379,30 @@ curl http://localhost:8000/runs
 curl "http://localhost:8000/runs/1?genus=Leptasterias&min_score=0.5"
 ```
 
-`PEMAD_DB_DSN` defaults to the local container above if unset. Known
-gap: `context_thumb_uri`/`crop_thumb_uri` come back as raw `gs://`
-paths once a run was ingested without `--skip-upload` -- a browser
-can't load those directly yet; resolving them to viewable URLs is a
-near-term follow-up, not yet decided (signed URLs vs. a read-access
-bucket policy).
+`PEMAD_DB_DSN` defaults to the local container above if unset.
+
+### Viewer (ported from the claude.ai Artifact prototype)
+
+Open `http://localhost:8000/` in a browser once the API above is
+running -- `static/viewer.html` is the same filter/chart/detail-panel
+viewer originally built as a claude.ai Artifact, pointed at this API
+instead of a static `manifest.json`. It loads the most recently
+ingested run by default, or a specific one via `?run=<id>`.
+
+The one real difference from the Artifact version: `context_thumb`/
+`crop_thumb` now point at this API's own `GET /thumb?uri=...` proxy
+(which streams the object from GCS, restricted to the configured
+output bucket) instead of a relative local path, since the schema
+only stores the `gs://` URI `ingest-run` uploaded them to and a
+browser can't load `gs://` directly. No caching/CDN on that proxy --
+fine for Phase 1 dev-scale thumbnail counts, not meant to survive past
+it unchanged.
+
+The claude.ai Artifact itself (https://claude.ai/artifact/JcAzKnB5Wob9Cq4j8Q52hW)
+is left as a frozen UI/UX demo with its original placeholder/example
+data -- a published Artifact page can't reach a private API like this
+one (no general-purpose fetch capability), so it was never going to be
+the live tool; this page is.
 
 ## Layout
 
@@ -400,6 +418,7 @@ bucket policy).
   - `viewer_export.py` -- re-derives per-detection crop thumbnails + a `manifest.json` from a completed run's run card (see "Results viewer assets" above)
   - `db_ingest.py` -- loads a `viewer_export.py` export into Postgres for the results-auditor app (see "Loading a run into Postgres" above, and `db/schema.sql`)
   - `api.py` -- Phase 1 read-only FastAPI service over the same schema (see "Running the Phase 1 read API locally" above)
+  - `static/viewer.html` -- the Phase 1 viewer, served by `api.py` at `/` (see "Viewer" above)
   - `gcs.py` -- small google-cloud-storage wrappers (upload/download text+bytes/list/exists/delete)
   - `airflow_client.py` -- triggers/queries the DAG via `gcloud composer environments run`
   - `batch_monitor.py` -- resolves and polls the resulting Cloud Batch job

@@ -19,22 +19,27 @@ into Postgres" in the README for standing that up and loading data):
     curl http://localhost:8000/runs
     curl "http://localhost:8000/runs/1?genus=Leptasterias&min_score=0.5"
 
-Known gap, deliberately not solved here: `context_thumb_uri` /
-`crop_thumb_uri` are raw gs:// paths once a run has been ingested with
-real GCS upload (not --skip-upload) -- a browser can't load those
-directly. Resolving them to viewable URLs (signed URLs, or a public/
-authenticated-read bucket) is a Phase 1 follow-up once the read shape
-below is confirmed to be the right one; deliberately not guessed at
-here since it's a real decision (signed-URL expiry + who can generate
-them) rather than a mechanical detail.
+`GET /runs/{id}` deliberately returns the SAME top-level shape as the
+`export-viewer-assets` manifest.json (created_at, model_type, images,
+annotations, ...) -- it's meant as a drop-in replacement for
+fetch('manifest.json') in the existing viewer, not a new contract the
+frontend has to learn. The one real difference: `context_thumb` /
+`crop_thumb` point at this API's own /thumb proxy (below) instead of a
+local relative path, since the DB only has the gs:// URI ingest-run
+uploaded them to, and a browser can't load gs:// directly.
 """
 from __future__ import annotations
 
+import mimetypes
 import os
 from typing import List, Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
@@ -42,6 +47,8 @@ DSN_ENV_VAR = "PEMAD_DB_DSN"
 DEFAULT_DSN = "postgresql://postgres:postgres@localhost:5432/viewer_dev"
 
 app = FastAPI(title="PEMAD Results Auditor API", version="0.1.0")
+
+STATIC_DIR = Path(__file__).parent / "static"
 
 # Permissive CORS for local dev only -- a real origin allowlist (or
 # same-origin serving) is a Phase 3 hardening item, not decided yet.
@@ -73,9 +80,48 @@ def run_query(sql: str, params: tuple = ()) -> List[dict]:
         get_pool().putconn(conn)
 
 
+def thumb_proxy_url(gs_uri: Optional[str]) -> Optional[str]:
+    """Rewrite a stored gs:// thumbnail URI into a same-origin URL this
+    API can actually serve to a browser (see /thumb below). None stays
+    None -- e.g. a run ingested with --skip-upload has no gs:// URI at
+    all, just the export's original local-relative path, which this API
+    can't serve either way (it never had the file)."""
+    if gs_uri is None or not gs_uri.startswith("gs://"):
+        return gs_uri
+    return f"/thumb?uri={quote(gs_uri, safe='')}"
+
+
+@app.get("/", include_in_schema=False)
+def viewer():
+    """Serves the Phase 1 viewer (static/viewer.html) -- the ported
+    version of the claude.ai Artifact prototype, pointed at this API
+    instead of a static manifest.json. Same-origin by construction, so
+    its fetch('/runs/...') calls need no CORS configuration."""
+    return FileResponse(STATIC_DIR / "viewer.html")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/thumb")
+def get_thumb(uri: str = Query(..., description="A gs:// URI previously stored by ingest-run's upload_assets()")):
+    """Streams one thumbnail from GCS, restricted to the configured
+    output bucket -- this is a proxy for exactly the thumbnails
+    ingest-run itself uploaded, not an open fetch-any-gs-object
+    endpoint. No caching/CDN here; fine for a few dozen/hundred
+    thumbnails in Phase 1 dev, not meant to survive past it unchanged."""
+    from . import config, gcs  # deferred: keeps api.py importable without google-cloud-storage installed
+
+    if not uri.startswith(f"gs://{config.OUTPUT_BUCKET}/"):
+        raise HTTPException(status_code=403, detail="uri is outside the configured output bucket")
+    try:
+        data = gcs.download_bytes(uri)
+    except Exception as exc:  # noqa: BLE001 -- surface as a 404, not a 500, for a missing/renamed object
+        raise HTTPException(status_code=404, detail=f"could not read {uri}: {exc}") from exc
+    content_type = mimetypes.guess_type(uri)[0] or "image/jpeg"
+    return Response(content=data, media_type=content_type)
 
 
 @app.get("/runs")
@@ -102,14 +148,9 @@ def get_run(
     limit: int = Query(2000, le=10000, description="Max detections returned"),
     offset: int = Query(0, ge=0),
 ):
-    """Manifest-shaped payload for one run: {run, images, annotations}.
-    Deliberately the same shape the viewer's manifest.json already has
-    (images + annotations, bbox as [x, y, w, h]) so porting the viewer
-    to call this instead of fetch('manifest.json') is a data-source
-    swap, not a rewrite of the render/filter logic already built.
-
-    Filters apply only to `annotations` -- `images` is always returned
-    in full for the run, since the detail panel needs every detection's
+    """manifest.json-shaped payload for one run -- see module docstring.
+    Filters apply only to `annotations`; `images` is always returned in
+    full for the run, since the detail panel needs every detection's
     sibling frame regardless of which detections are currently filtered
     in."""
     run_rows = run_query("SELECT * FROM runs WHERE id = %s", (run_id,))
@@ -117,7 +158,7 @@ def get_run(
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     run = run_rows[0]
 
-    images = run_query(
+    image_rows = run_query(
         """
         SELECT id, file_name, source_uri, width, height, stereo_side,
                stereo_crop_x_offset, context_thumb_uri
@@ -125,6 +166,19 @@ def get_run(
         """,
         (run_id,),
     )
+    images = [
+        {
+            "id": im["id"],
+            "file_name": im["file_name"],
+            "source_uri": im["source_uri"],
+            "width": im["width"],
+            "height": im["height"],
+            "stereo_side": im["stereo_side"],
+            "stereo_crop_x_offset": im["stereo_crop_x_offset"],
+            "context_thumb": thumb_proxy_url(im["context_thumb_uri"]),
+        }
+        for im in image_rows
+    ]
 
     clauses = ["d.run_id = %s"]
     params: list = [run_id]
@@ -142,7 +196,7 @@ def get_run(
         params.append(max_score)
     params.extend([limit, offset])
 
-    detections = run_query(
+    det_rows = run_query(
         f"""
         SELECT d.id, d.image_id, d.bbox_x, d.bbox_y, d.bbox_w, d.bbox_h,
                d.category_id, d.category_name, d.score, d.genus, d.genus_confidence,
@@ -155,7 +209,6 @@ def get_run(
         """,
         tuple(params),
     )
-
     annotations = [
         {
             "id": d["id"],
@@ -168,9 +221,19 @@ def get_run(
             "genus_confidence": d["genus_confidence"],
             "species": d["species"],
             "species_confidence": d["species_confidence"],
-            "crop_thumb_uri": d["crop_thumb_uri"],
+            "crop_thumb": thumb_proxy_url(d["crop_thumb_uri"]),
         }
-        for d in detections
+        for d in det_rows
     ]
 
-    return {"run": run, "images": images, "annotations": annotations}
+    return {
+        "run_card": run["run_card_uri"],
+        "model_type": run["model_type"],
+        "created_at": run["created_at"],
+        "stereo_side": run["stereo_side"],
+        "input_file": run["input_file_uri"],
+        "output_file": run["output_file_uri"],
+        "yaml_config_snapshot": run["yaml_config_snapshot"],
+        "images": images,
+        "annotations": annotations,
+    }
