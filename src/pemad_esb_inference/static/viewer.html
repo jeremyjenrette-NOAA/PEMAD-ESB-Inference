@@ -175,9 +175,11 @@ button.link-btn {
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
   overflow: hidden; cursor: pointer; text-align: left; font-family: inherit;
-  padding: 0; display: flex; flex-direction: column;
+  padding: 0; display: flex; flex-direction: column; position: relative;
   transition: border-color 0.12s, transform 0.1s;
 }
+.card.selected { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
+.card.pending { opacity: 0.55; pointer-events: none; }
 .card:hover { border-color: var(--accent); transform: translateY(-1px); }
 .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .card .thumb-wrap { aspect-ratio: 4 / 3; background: var(--surface-2); overflow: hidden; }
@@ -251,6 +253,30 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .review-history-item:last-child { border-bottom: none; }
 
+.select-overlay {
+  position: absolute; top: 6px; left: 6px; font-size: 1rem; line-height: 1;
+  background: rgba(0,0,0,0.55); color: #fff; border-radius: 4px; padding: 1px 5px; z-index: 2;
+}
+.quick-review-row { display: flex; gap: 6px; margin-top: 6px; }
+button.quick-btn {
+  flex: 1; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  border-radius: 6px; padding: 4px 0; font-size: 0.78rem; cursor: pointer;
+}
+button.quick-btn.quick-confirm:hover { border-color: var(--good); color: var(--good); }
+button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(--critical); }
+.bulk-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 12px; margin-bottom: 10px; font-size: 0.85rem;
+}
+.bulk-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+.toast {
+  position: fixed; bottom: 18px; right: 18px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  z-index: 50; max-width: 320px;
+}
+.toast.error { border-color: var(--critical); color: var(--critical); }
+
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -314,6 +340,7 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   <div class="quick-actions" style="margin-top:8px;">
     <button class="link-btn" id="needs-review-btn">Flag for review (confidence &lt; 0.40)</button>
     <button class="link-btn" id="clear-filters-btn">Clear all filters</button>
+    <button class="link-btn" id="select-mode-btn">Select multiple</button>
   </div>
 </div>
 
@@ -335,6 +362,13 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 <div class="results-meta">
   <span id="results-count">—</span>
   <span id="skipped-note"></span>
+</div>
+<div class="bulk-bar" id="bulk-bar" hidden>
+  <span id="bulk-count">0 selected</span>
+  <button type="button" class="submit-review-btn" id="bulk-confirm-btn">Confirm selected</button>
+  <button type="button" class="decision-btn" id="bulk-reject-btn">Reject selected</button>
+  <button type="button" class="link-btn" id="bulk-clear-btn">Clear selection</button>
+  <button type="button" class="link-btn" id="bulk-exit-btn">Exit select mode</button>
 </div>
 <div class="grid" id="results-grid"></div>
 <div class="empty-state" id="empty-state" hidden>No detections match these filters.</div>
@@ -383,6 +417,8 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   </div>
 </div>
 
+<div class="toast" id="toast" hidden></div>
+
 <script>
 (function () {
   const CAT_COLORS = ["--cat-1","--cat-2","--cat-3","--cat-4","--cat-5","--cat-6","--cat-7","--cat-8"];
@@ -399,12 +435,15 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     reviewStatusFilter: "",
     sort: "score-desc",
     selectedAnnotationId: null,
+    selectMode: false,
+    selectedIds: new Set(),
   };
 
   let manifest = null;
   let genusColor = {};
   let genusOrder = [];
   let selectedDecision = null;
+  let toastTimer = null;
 
   function colorFor(genus) {
     return "var(" + (genusColor[genus] || "--muted") + ")";
@@ -442,6 +481,114 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
       case "uncertain": return "? uncertain";
       default: return "unreviewed";
     }
+  }
+
+  function showToast(message, isError) {
+    const el = byId("toast");
+    el.textContent = message;
+    el.classList.toggle("error", Boolean(isError));
+    el.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 2600);
+  }
+
+  function updateReviewedStat() {
+    const reviewedCount = manifest.annotations.filter((a) => a.review).length;
+    const statEl = byId("reviewed-stat-value");
+    if (statEl) statEl.textContent = `${reviewedCount}/${manifest.annotations.length}`;
+  }
+
+  function postReview(detectionId, body) {
+    return fetch(`/detections/${detectionId}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => {
+      if (!r.ok) return r.json().then((d) => { throw new Error((d && d.detail) || `HTTP ${r.status}`); });
+      return r.json();
+    });
+  }
+
+  function quickReview(annotationId, decision, cardEl) {
+    const reviewer = byId("reviewer-input").value.trim();
+    if (!reviewer) {
+      showToast('Set "Reviewing as" before reviewing.', true);
+      byId("reviewer-input").focus();
+      return;
+    }
+    saveReviewer(reviewer);
+    const ann = manifest.annotations.find((a) => a.id === annotationId);
+    if (!ann) return;
+    if (cardEl) cardEl.classList.add("pending");
+    postReview(annotationId, { decision, reviewer, corrected_genus: null, corrected_species: null, notes: null })
+      .then((saved) => {
+        ann.review = saved;
+        renderGrid();
+        updateReviewedStat();
+        showToast(`${reviewBadgeGlyph(decision)} saved for ${ann.genus} ${ann.species}`);
+      })
+      .catch((err) => {
+        if (cardEl) cardEl.classList.remove("pending");
+        showToast("Could not save review: " + err.message, true);
+      });
+  }
+
+  function toggleSelect(id) {
+    if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+    else state.selectedIds.add(id);
+    renderGrid();
+    updateBulkBar();
+  }
+
+  function updateBulkBar() {
+    const bar = byId("bulk-bar");
+    bar.hidden = !state.selectMode;
+    byId("bulk-count").textContent = `${state.selectedIds.size} selected`;
+    const hasSelection = state.selectedIds.size > 0;
+    byId("bulk-confirm-btn").disabled = !hasSelection;
+    byId("bulk-reject-btn").disabled = !hasSelection;
+  }
+
+  function bulkReview(decision) {
+    const reviewer = byId("reviewer-input").value.trim();
+    if (!reviewer) {
+      showToast('Set "Reviewing as" before reviewing.', true);
+      byId("reviewer-input").focus();
+      return;
+    }
+    saveReviewer(reviewer);
+    const ids = [...state.selectedIds];
+    if (!ids.length) return;
+    byId("bulk-confirm-btn").disabled = true;
+    byId("bulk-reject-btn").disabled = true;
+    Promise.allSettled(
+      ids.map((id) =>
+        postReview(id, { decision, reviewer, corrected_genus: null, corrected_species: null, notes: null })
+          .then((saved) => ({ id, saved }))
+      )
+    ).then((results) => {
+      let okCount = 0;
+      results.forEach((r) => {
+        if (r.status === "fulfilled") {
+          const ann = manifest.annotations.find((a) => a.id === r.value.id);
+          if (ann) ann.review = r.value.saved;
+          okCount++;
+        }
+      });
+      state.selectedIds.clear();
+      renderGrid();
+      updateReviewedStat();
+      updateBulkBar();
+      showToast(`${reviewBadgeGlyph(decision)}: ${okCount}/${ids.length} saved${okCount < ids.length ? " (some failed)" : ""}`, okCount < ids.length);
+    });
+  }
+
+  function selectDecision(decision) {
+    selectedDecision = decision;
+    byId("decision-btns").querySelectorAll(".decision-btn").forEach((b) => b.classList.toggle("active", b.dataset.decision === decision));
+    byId("correction-fields").hidden = decision !== "relabeled";
+    updateSubmitEnabled();
+    if (decision === "relabeled") byId("corrected-genus-input").focus();
   }
 
   function init(data) {
@@ -618,18 +765,48 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     });
     byId("detail-close").addEventListener("click", closeDetail);
     byId("detail-overlay").addEventListener("click", (e) => { if (e.target.id === "detail-overlay") closeDetail(); });
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDetail(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { closeDetail(); return; }
+      if (byId("detail-overlay").hidden) return;
+      const tag = e.target && e.target.tagName;
+      const isTextarea = tag === "TEXTAREA";
+      if (e.key === "Enter" && !isTextarea) {
+        if (!byId("submit-review-btn").disabled) {
+          e.preventDefault();
+          submitReview();
+        }
+        return;
+      }
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const keyMap = { c: "confirmed", x: "rejected", l: "relabeled", u: "uncertain" };
+      const decision = keyMap[e.key.toLowerCase()];
+      if (decision) {
+        e.preventDefault();
+        selectDecision(decision);
+      }
+    });
 
     byId("decision-btns").querySelectorAll(".decision-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        selectedDecision = btn.dataset.decision;
-        byId("decision-btns").querySelectorAll(".decision-btn").forEach((b) => b.classList.toggle("active", b === btn));
-        byId("correction-fields").hidden = selectedDecision !== "relabeled";
-        updateSubmitEnabled();
-      });
+      btn.addEventListener("click", () => selectDecision(btn.dataset.decision));
     });
     byId("corrected-genus-input").addEventListener("input", updateSubmitEnabled);
     byId("submit-review-btn").addEventListener("click", submitReview);
+
+    byId("select-mode-btn").addEventListener("click", () => {
+      state.selectMode = !state.selectMode;
+      if (!state.selectMode) state.selectedIds.clear();
+      byId("select-mode-btn").textContent = state.selectMode ? "Exit select mode" : "Select multiple";
+      renderGrid();
+      updateBulkBar();
+    });
+    byId("bulk-confirm-btn").addEventListener("click", () => bulkReview("confirmed"));
+    byId("bulk-reject-btn").addEventListener("click", () => bulkReview("rejected"));
+    byId("bulk-clear-btn").addEventListener("click", () => { state.selectedIds.clear(); renderGrid(); updateBulkBar(); });
+    byId("bulk-exit-btn").addEventListener("click", () => {
+      state.selectMode = false; state.selectedIds.clear();
+      byId("select-mode-btn").textContent = "Select multiple";
+      renderGrid(); updateBulkBar();
+    });
   }
 
   function updateSubmitEnabled() {
@@ -654,22 +831,12 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     const errBox = byId("review-submit-error");
     errBox.hidden = true;
     byId("submit-review-btn").disabled = true;
-    fetch(`/detections/${ann.id}/review`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    })
-      .then((r) => {
-        if (!r.ok) return r.json().then((d) => { throw new Error((d && d.detail) || `HTTP ${r.status}`); });
-        return r.json();
-      })
+    postReview(ann.id, body)
       .then((saved) => {
         ann.review = saved;
         renderReviewSection(ann);
         renderGrid();
-        const reviewedCount = manifest.annotations.filter((a) => a.review).length;
-        const statEl = byId("reviewed-stat-value");
-        if (statEl) statEl.textContent = `${reviewedCount}/${manifest.annotations.length}`;
+        updateReviewedStat();
       })
       .catch((err) => {
         errBox.textContent = "Could not save review: " + err.message;
@@ -720,14 +887,18 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     byId("empty-state").hidden = filtered.length !== 0;
 
     filtered.forEach((a) => {
-      const card = document.createElement("button");
-      card.type = "button";
-      card.className = "card";
+      const card = document.createElement("div");
+      card.className = "card" + (state.selectedIds.has(a.id) ? " selected" : "");
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
       const tier = confidenceTier(a.score);
       const gTier = confidenceTier(a.genus_confidence);
       const sTier = confidenceTier(a.species_confidence);
       card.innerHTML = `
-        <div class="thumb-wrap"><img loading="lazy" src="${a.crop_thumb}" alt="${a.genus} ${a.species} detection crop"></div>
+        <div class="thumb-wrap">
+          ${state.selectMode ? `<div class="select-overlay">${state.selectedIds.has(a.id) ? "☑" : "☐"}</div>` : ""}
+          <img loading="lazy" src="${a.crop_thumb}" alt="${a.genus} ${a.species} detection crop">
+        </div>
         <div class="card-body">
           <div class="taxon"><span class="genus" style="color:${colorFor(a.genus)}">${a.genus}</span> <span class="species">${a.species}</span></div>
           <div class="pills">
@@ -736,9 +907,24 @@ button.submit-review-btn:disabled { opacity: 0.5; cursor: not-allowed; }
             <span class="pill" style="background:${sTier.css}" title="Species confidence">${a.species_confidence.toFixed(2)}</span>
           </div>
           <div class="review-badge" style="background:${reviewBadgeColor(a.review && a.review.decision)}">${reviewBadgeGlyph(a.review && a.review.decision)}</div>
+          <div class="quick-review-row">
+            <button type="button" class="quick-btn quick-confirm" title="Quick confirm">✓ Confirm</button>
+            <button type="button" class="quick-btn quick-reject" title="Quick reject">✕ Reject</button>
+          </div>
         </div>
       `;
-      card.addEventListener("click", () => openDetail(a.id));
+      card.querySelector(".quick-confirm").addEventListener("click", (e) => { e.stopPropagation(); quickReview(a.id, "confirmed", card); });
+      card.querySelector(".quick-reject").addEventListener("click", (e) => { e.stopPropagation(); quickReview(a.id, "rejected", card); });
+      card.addEventListener("click", () => {
+        if (state.selectMode) toggleSelect(a.id);
+        else openDetail(a.id);
+      });
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          if (state.selectMode) toggleSelect(a.id); else openDetail(a.id);
+        }
+      });
       grid.appendChild(card);
     });
   }

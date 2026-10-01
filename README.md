@@ -465,12 +465,39 @@ stay distinct, so prediction-vs-human-label performance can be tracked
 over time, and a disagreement between auditors is data, not something
 to discard.
 
-As of this writing, Phase 2 has been verified directly against a real
-Postgres instance (the schema/migration SQL and the `ReviewIn`
-pydantic validation) but **not yet run as a live `uvicorn` server
-against a real browser** -- unlike Phase 1, which was tested
-end-to-end on real data on two machines. Treat the review UI as built
-but not yet field-tested until that happens.
+Verified end-to-end via the `jeremy-dev-ws3` Workstation + tunnel setup
+(the same path Phase 1 used) -- submitting decisions, badges/filters
+updating, history loading, all against a real `uvicorn` server and a
+real browser.
+
+### Batch-review throughput (Phase 2.5)
+
+Reviewing one detection at a time -- open panel, click a decision,
+click submit, close, reopen -- doesn't scale to auditing dozens or
+hundreds of detections in a sitting, so the viewer has three ways to
+cut that down:
+
+- **Keyboard shortcuts**, while the detail panel is open: `C` confirms,
+  `X` rejects, `L` starts a relabel (focuses the corrected-genus field),
+  `U` marks uncertain, and `Enter` submits once a decision is valid --
+  all ignored while typing in a text field, so they're safe to use
+  without worrying about where focus is. `Escape` still closes the
+  panel.
+- **Quick confirm/reject on each card**, for the common case where a
+  detection doesn't need a closer look: two small buttons under the
+  pills `POST` directly to `/detections/{id}/review` without opening
+  the detail panel at all. (Relabeling still needs the panel, since it
+  needs the correction fields.)
+- **Multi-select + bulk confirm/reject**: "Select multiple" turns each
+  card into a checkbox; a bar above the grid shows the selection count
+  and "Confirm selected"/"Reject selected" buttons that fire all the
+  requests at once (`Promise.allSettled`, so one failure doesn't block
+  the rest) and report how many succeeded.
+
+All three write through the same reviewer name as the detail panel
+(the "Reviewing as" field) -- quick/bulk actions are blocked with an
+inline message if that field is empty, same validation as a normal
+submit.
 
 ## Layout
 
