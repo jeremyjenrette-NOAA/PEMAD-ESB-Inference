@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import threading
+from contextlib import contextmanager
 from typing import Dict, List, Literal, Optional
 from urllib.parse import quote
 
@@ -52,6 +54,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
+import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
@@ -74,35 +77,61 @@ app.add_middleware(
 _pool: Optional["pool.SimpleConnectionPool"] = None
 
 
-def get_pool() -> "pool.SimpleConnectionPool":
+# FastAPI runs these sync endpoints in a thread pool, so the DB pool must be
+# thread-safe (ThreadedConnectionPool, not SimpleConnectionPool), and callers
+# must WAIT for a free connection instead of failing when all are busy -- a
+# bulk review fires many requests at once, and psycopg2's pools raise
+# "connection pool exhausted" rather than queueing.
+POOL_MAX = 8
+_pool_slots = threading.BoundedSemaphore(POOL_MAX)
+_pool_init_lock = threading.Lock()
+
+
+def get_pool() -> "pool.ThreadedConnectionPool":
     global _pool
     if _pool is None:
-        dsn = os.environ.get(DSN_ENV_VAR, DEFAULT_DSN)
-        _pool = pool.SimpleConnectionPool(1, 5, dsn)
+        with _pool_init_lock:
+            if _pool is None:
+                dsn = os.environ.get(DSN_ENV_VAR, DEFAULT_DSN)
+                _pool = pool.ThreadedConnectionPool(1, POOL_MAX, dsn)
     return _pool
 
 
-def run_query(sql: str, params: tuple = ()) -> List[dict]:
-    conn = get_pool().getconn()
+@contextmanager
+def _borrow():
+    """Yields a pooled connection, blocking until one is free. A connection
+    that died (e.g. the Cloud SQL proxy restarted) is closed instead of being
+    handed to the next request."""
+    _pool_slots.acquire()
+    conn = None
+    broken = False
     try:
+        conn = get_pool().getconn()
+        yield conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        broken = True
+        raise
+    finally:
+        if conn is not None:
+            get_pool().putconn(conn, close=broken)
+        _pool_slots.release()
+
+
+def run_query(sql: str, params: tuple = ()) -> List[dict]:
+    with _borrow() as conn:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
-    finally:
-        get_pool().putconn(conn)
 
 
 def run_insert_returning(sql: str, params: dict) -> dict:
     """Like run_query, but for a single-row INSERT ... RETURNING *,
     committing the transaction (run_query's `with conn` already commits
     on success / rolls back on exception, same as here)."""
-    conn = get_pool().getconn()
-    try:
+    with _borrow() as conn:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
             return dict(cur.fetchone())
-    finally:
-        get_pool().putconn(conn)
 
 
 def thumb_proxy_url(gs_uri: Optional[str]) -> Optional[str]:

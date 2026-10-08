@@ -599,25 +599,40 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     if (!ids.length) return;
     byId("bulk-confirm-btn").disabled = true;
     byId("bulk-reject-btn").disabled = true;
-    Promise.allSettled(
-      ids.map((id) =>
-        postReview(id, { decision, reviewer, corrected_genus: null, corrected_species: null, notes: null })
-          .then((saved) => ({ id, saved }))
-      )
-    ).then((results) => {
+    // A few requests at a time rather than all at once: keeps the API and the
+    // Cloud SQL connection from being swamped by a large selection.
+    const results = [];
+    let next = 0;
+    const worker = () => {
+      if (next >= ids.length) return Promise.resolve();
+      const id = ids[next++];
+      return postReview(id, { decision, reviewer, corrected_genus: null, corrected_species: null, notes: null })
+        .then((saved) => { results.push({ ok: true, id, saved }); })
+        .catch((err) => { results.push({ ok: false, id, message: err.message }); })
+        .then(worker);
+    };
+    Promise.all([worker(), worker(), worker(), worker()]).then(() => {
       let okCount = 0;
+      let firstError = null;
       results.forEach((r) => {
-        if (r.status === "fulfilled") {
-          const ann = manifest.annotations.find((a) => a.id === r.value.id);
-          if (ann) ann.review = r.value.saved;
+        if (r.ok) {
+          const ann = manifest.annotations.find((a) => a.id === r.id);
+          if (ann) ann.review = r.saved;
+          state.selectedIds.delete(r.id);   // failed ones stay selected so you can just retry
           okCount++;
+        } else if (!firstError) {
+          firstError = r.message;
         }
       });
-      state.selectedIds.clear();
       renderGrid();
       updateReviewedStat();
       updateBulkBar();
-      showToast(`${reviewBadgeGlyph(decision)}: ${okCount}/${ids.length} saved${okCount < ids.length ? " (some failed)" : ""}`, okCount < ids.length);
+      const failed = ids.length - okCount;
+      showToast(
+        `${reviewBadgeGlyph(decision)}: ${okCount}/${ids.length} saved` +
+          (failed ? ` — ${failed} failed (${firstError}); still selected, try again` : ""),
+        failed > 0
+      );
     });
   }
 
