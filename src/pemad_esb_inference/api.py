@@ -143,9 +143,12 @@ def get_thumb(uri: str = Query(..., description="A gs:// URI previously stored b
     try:
         data = gcs.download_bytes(uri)
     except Exception as exc:  # noqa: BLE001 -- surface as a 404, not a 500, for a missing/renamed object
+        import logging
+        logging.getLogger("uvicorn.error").warning("thumb read failed for %s: %s", uri, exc)
         raise HTTPException(status_code=404, detail=f"could not read {uri}: {exc}") from exc
     content_type = mimetypes.guess_type(uri)[0] or "image/jpeg"
-    return Response(content=data, media_type=content_type)
+    # Thumbnails never change once ingested, so let the browser keep them.
+    return Response(content=data, media_type=content_type, headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/runs")

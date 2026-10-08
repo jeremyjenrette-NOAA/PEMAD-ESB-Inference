@@ -194,6 +194,15 @@ button.link-btn {
   font-variant-numeric: tabular-nums; color: #0b0b0b;
 }
 .empty-state { text-align: center; color: var(--muted); padding: 40px 12px; font-size: 0.92rem; }
+.pager { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 12px 0; font-size: 0.85rem; color: var(--text-2); }
+.pager button, .detail-nav button {
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 5px 12px; font-size: 0.82rem; cursor: pointer; font-family: inherit;
+}
+.pager button:disabled, .detail-nav button:disabled { opacity: 0.4; cursor: default; }
+.detail-nav { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 0.82rem; color: var(--text-2); }
+.detail-nav .nav-hint { margin-left: auto; color: var(--muted); font-size: 0.74rem; }
+img.thumb-failed { opacity: 0.25; }
 
 .detail-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 20;
@@ -311,6 +320,12 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
       </select>
     </div>
     <div class="field">
+      <label for="year-select">Year</label>
+      <select id="year-select">
+        <option value="">All years</option>
+      </select>
+    </div>
+    <div class="field">
       <label for="min-score">Min. detection confidence</label>
       <div class="slider-row">
         <input type="range" id="min-score" min="0" max="1" step="0.01" value="0">
@@ -370,7 +385,9 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
   <button type="button" class="link-btn" id="bulk-clear-btn">Clear selection</button>
   <button type="button" class="link-btn" id="bulk-exit-btn">Exit select mode</button>
 </div>
+<div class="pager" id="pager-top"></div>
 <div class="grid" id="results-grid"></div>
+<div class="pager" id="pager-bottom"></div>
 <div class="empty-state" id="empty-state" hidden>No detections match these filters.</div>
 
 <div class="detail-overlay" id="detail-overlay" hidden>
@@ -381,6 +398,12 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
         <div style="color:var(--text-2); font-size:0.85rem;" id="detail-file">—</div>
       </div>
       <button class="detail-close" id="detail-close" aria-label="Close">✕</button>
+    </div>
+    <div class="detail-nav">
+      <button type="button" id="detail-prev" title="Previous detection (Left arrow)">‹ Prev</button>
+      <span id="detail-pos">—</span>
+      <button type="button" id="detail-next" title="Next detection (Right arrow)">Next ›</button>
+      <span class="nav-hint">← → to move</span>
     </div>
     <div class="frame-wrap" id="frame-wrap">
       <img id="frame-img" alt="Source frame">
@@ -437,6 +460,10 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     selectedAnnotationId: null,
     selectMode: false,
     selectedIds: new Set(),
+    year: "",
+    page: 0,
+    pageSize: 60,
+    detailIdx: -1,
   };
 
   let manifest = null;
@@ -444,6 +471,17 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
   let genusOrder = [];
   let selectedDecision = null;
   let toastTimer = null;
+  let currentFiltered = [];   // the filtered+sorted list the grid and prev/next both walk
+  let lastFilterSig = null;   // when filters/sort change, jump back to page 1
+
+  // Year of a frame: file names look like 202303.20230615.173047796.3825.png
+  // (YYYYMM.YYYYMMDD...); fall back to a /YYYY/ folder in the source path.
+  function yearOf(image) {
+    let m = /^(\d{4})\d{2}\./.exec(image.file_name || "");
+    if (m) return m[1];
+    m = /\/((?:19|20)\d{2})\//.exec(image.source_uri || "");
+    return m ? m[1] : "";
+  }
 
   function colorFor(genus) {
     return "var(" + (genusColor[genus] || "--muted") + ")";
@@ -609,9 +647,20 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     renderMasthead();
     renderGenusChips(genusCounts);
     renderStereoFilter();
+    renderYearFilter();
     renderOverview(genusCounts);
     wireControls();
     renderGrid();
+  }
+
+  function renderYearFilter() {
+    const years = [...new Set(manifest.images.map(yearOf).filter(Boolean))].sort();
+    const sel = byId("year-select");
+    years.forEach((y) => {
+      const o = document.createElement("option");
+      o.value = y; o.textContent = y;
+      sel.appendChild(o);
+    });
   }
 
   function renderMasthead() {
@@ -725,6 +774,9 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     byId("search-input").addEventListener("input", (e) => { state.search = e.target.value.toLowerCase(); renderGrid(); });
     byId("sort-select").addEventListener("change", (e) => { state.sort = e.target.value; renderGrid(); });
     byId("stereo-select").addEventListener("change", (e) => { state.stereoFilter = e.target.value; renderGrid(); });
+    byId("year-select").addEventListener("change", (e) => { state.year = e.target.value; renderGrid(); });
+    byId("detail-prev").addEventListener("click", () => navDetail(-1));
+    byId("detail-next").addEventListener("click", () => navDetail(1));
     const reviewerInput = byId("reviewer-input");
     reviewerInput.value = getSavedReviewer();
     reviewerInput.addEventListener("input", (e) => { saveReviewer(e.target.value); updateSubmitEnabled(); });
@@ -760,6 +812,7 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
       state.maxScore = null; state.reviewMode = false; slider.disabled = false;
       reviewBtn.textContent = "Flag for review (confidence < 0.40)"; reviewBtn.style.color = "";
       state.stereoFilter = ""; byId("stereo-select").value = "";
+      state.year = ""; byId("year-select").value = "";
       state.reviewStatusFilter = ""; byId("review-status-select").value = "";
       renderGrid();
     });
@@ -778,6 +831,8 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
         return;
       }
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.key === "ArrowRight") { e.preventDefault(); navDetail(1); return; }
+      if (e.key === "ArrowLeft") { e.preventDefault(); navDetail(-1); return; }
       const keyMap = { c: "confirmed", x: "rejected", l: "relabeled", u: "uncertain" };
       const decision = keyMap[e.key.toLowerCase()];
       if (decision) {
@@ -850,6 +905,7 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     if (state.maxScore != null && a.score >= state.maxScore) return false;
     if (state.genusFilter.size && !state.genusFilter.has(a.genus)) return false;
     if (state.stereoFilter && image.stereo_side !== state.stereoFilter) return false;
+    if (state.year && yearOf(image) !== state.year) return false;
     if (state.reviewStatusFilter) {
       const decision = a.review && a.review.decision;
       if (state.reviewStatusFilter === "unreviewed") {
@@ -880,13 +936,28 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
   function renderGrid() {
     const imagesById = manifest._imagesById;
     const filtered = sortAnnotations(manifest.annotations.filter((a) => matchesFilters(a, imagesById.get(a.image_id))));
+    currentFiltered = filtered;
 
-    byId("results-count").textContent = `Showing ${filtered.length} of ${manifest.annotations.length} detections`;
+    // Changing any filter or the sort jumps back to page 1; re-renders for other
+    // reasons (a saved review, select mode) keep the current page.
+    const sig = JSON.stringify([state.search, [...state.genusFilter].sort(), state.minScore, state.maxScore,
+                                state.stereoFilter, state.year, state.reviewStatusFilter, state.sort]);
+    if (sig !== lastFilterSig) { state.page = 0; lastFilterSig = sig; }
+    const pageCount = Math.max(1, Math.ceil(filtered.length / state.pageSize));
+    if (state.page > pageCount - 1) state.page = pageCount - 1;
+    const start = state.page * state.pageSize;
+    const pageItems = filtered.slice(start, start + state.pageSize);
+
+    byId("results-count").textContent = filtered.length
+      ? `Showing ${start + 1}–${start + pageItems.length} of ${filtered.length} matching (${manifest.annotations.length} detections in run)`
+      : `0 matching (${manifest.annotations.length} detections in run)`;
+    renderPager(pageCount);
     const grid = byId("results-grid");
     grid.innerHTML = "";
     byId("empty-state").hidden = filtered.length !== 0;
+    if (!byId("detail-overlay").hidden) updateDetailNav();
 
-    filtered.forEach((a) => {
+    pageItems.forEach((a) => {
       const card = document.createElement("div");
       card.className = "card" + (state.selectedIds.has(a.id) ? " selected" : "");
       card.tabIndex = 0;
@@ -929,10 +1000,65 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     });
   }
 
+  function goToPage(p) {
+    const pageCount = Math.max(1, Math.ceil(currentFiltered.length / state.pageSize));
+    state.page = Math.min(Math.max(0, p), pageCount - 1);
+    renderGrid();
+    byId("pager-top").scrollIntoView({ block: "start" });
+  }
+
+  function renderPager(pageCount) {
+    ["pager-top", "pager-bottom"].forEach((id) => {
+      const el = byId(id);
+      if (pageCount <= 1) { el.innerHTML = ""; return; }
+      el.innerHTML = `
+        <button type="button" data-p="first" ${state.page === 0 ? "disabled" : ""}>«</button>
+        <button type="button" data-p="prev" ${state.page === 0 ? "disabled" : ""}>‹ Prev</button>
+        <span>Page ${state.page + 1} of ${pageCount}</span>
+        <button type="button" data-p="next" ${state.page >= pageCount - 1 ? "disabled" : ""}>Next ›</button>
+        <button type="button" data-p="last" ${state.page >= pageCount - 1 ? "disabled" : ""}>»</button>
+      `;
+      el.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+        const k = b.dataset.p;
+        if (k === "first") goToPage(0);
+        else if (k === "prev") goToPage(state.page - 1);
+        else if (k === "next") goToPage(state.page + 1);
+        else goToPage(pageCount - 1);
+      }));
+    });
+  }
+
+  // Prev/next inside the open detail panel walks the same filtered+sorted list
+  // as the grid, across page boundaries.
+  function updateDetailNav() {
+    const total = currentFiltered.length;
+    const pos = currentFiltered.findIndex((x) => x.id === state.selectedAnnotationId);
+    byId("detail-pos").textContent = pos >= 0 ? `${pos + 1} of ${total}` : `— of ${total}`;
+    byId("detail-prev").disabled = total === 0 || pos === 0;
+    byId("detail-next").disabled = total === 0 || pos === total - 1;
+  }
+
+  function navDetail(delta) {
+    const total = currentFiltered.length;
+    if (!total) return;
+    const pos = currentFiltered.findIndex((x) => x.id === state.selectedAnnotationId);
+    // If the open detection just dropped out of the current filter (e.g. it was
+    // reviewed while filtering to "Unreviewed"), the item now sitting at its old
+    // index is the next one.
+    const target = pos >= 0 ? pos + delta : (delta > 0 ? state.detailIdx : state.detailIdx - 1);
+    if (target < 0 || target >= total) return;
+    const targetPage = Math.floor(target / state.pageSize);
+    if (targetPage !== state.page) { state.page = targetPage; renderGrid(); }
+    openDetail(currentFiltered[target].id);
+  }
+
   function openDetail(annotationId) {
     const ann = manifest.annotations.find((a) => a.id === annotationId);
     const image = manifest._imagesById.get(ann.image_id);
     state.selectedAnnotationId = annotationId;
+    const listPos = currentFiltered.findIndex((x) => x.id === annotationId);
+    if (listPos >= 0) state.detailIdx = listPos;
+    updateDetailNav();
 
     byId("detail-taxon").innerHTML = `<span style="color:${colorFor(ann.genus)}">${ann.genus}</span> <em style="color:var(--text-2)">${ann.species}</em>`;
     byId("detail-file").textContent = `${image.file_name} · ${image.stereo_side} eye · ${image.width}×${image.height}px`;
@@ -1048,8 +1174,22 @@ button.quick-btn.quick-reject:hover { border-color: var(--critical); color: var(
     return id ? parseInt(id, 10) : null;
   }
 
+  // Thumbnails go through the tunnel and the /thumb proxy; when a request is
+  // dropped under load, retry it a few times before giving up.
+  document.addEventListener("error", (e) => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement) || !img.getAttribute("src")) return;
+    const n = parseInt(img.dataset.retries || "0", 10);
+    if (n >= 3) { img.classList.add("thumb-failed"); return; }
+    img.dataset.retries = String(n + 1);
+    if (!img.dataset.origSrc) img.dataset.origSrc = img.getAttribute("src");
+    const base = img.dataset.origSrc;
+    setTimeout(() => { img.src = base + (base.includes("?") ? "&" : "?") + "retry=" + (n + 1); }, 500 * (n + 1));
+  }, true);
+
+  // The API's default page is 2000 detections; real runs have thousands, so ask for the max.
   function loadRun(runId) {
-    return fetch(`/runs/${runId}`).then((r) => {
+    return fetch(`/runs/${runId}?limit=10000`).then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status} loading run ${runId}`);
       return r.json();
     });
