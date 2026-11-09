@@ -170,18 +170,21 @@ shape instead, embedding the staged/rewritten YAML config inline:
 ```bash
 pemad-infer trigger \
   --model star-cascade \
-  --weights-file models/24star_yolo12n_gcp_20260909_174845/weights/best.pt \
-  --extra-weights classifier_weights=models/24star_yolo12n_gcp_20260909_174845/weights/star_tax.pt \
-  --extra-weights taxonomy_json=models/24star_yolo12n_gcp_20260909_174845/weights/star_taxonomy.json \
+  --weights-file models/24star_yolo12m_gcp_20261001_184534/weights/best.pt \
+  --extra-weights classifier_weights=models/24star_yolo12m_gcp_20261001_184534/weights/star_tax.pt \
+  --extra-weights taxonomy_json=models/24star_yolo12m_gcp_20261001_184534/weights/star_taxonomy.json \
   --yaml-config configs/two_stage/template.yaml \
   --combined-image-contract \
   --stereo-side left \
-  --run-name star-cascade_20260930_left_v2 \
+  --run-name star-cascade_20261002 \
   --survey-prefix "gs://nmfs-dev-uc1-landing-bucket/NEFSC/HabCam Survey/habcam/proc/Images/2023/" \
-  --sample-rate 500 \
+  --sample-rate 5 \
   --gcs-prefix jeremy \
   --wait
 ```
+
+`nohup [above command] > ./log/DAG_trigger_$(date +%Y%m%d_%H%M%S).log 2>&1 &`
+
 The output file this writes to is run-specific by default --
 `gs://<bucket>/<output-folder>/<run-name>/annotations.json` -- so
 consecutive runs against the same `--output-folder` no longer overwrite

@@ -26,3 +26,8 @@ pemad-infer = "pemad_esb_inference.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The API serves static/viewer.html; a non-editable `pip install .` (e.g. in the
+# container image) leaves it out unless it is declared here.
+[tool.setuptools.package-data]
+pemad_esb_inference = ["static/*.html"]
