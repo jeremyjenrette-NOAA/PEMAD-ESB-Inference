@@ -6,8 +6,40 @@ from datetime import datetime
 from typing import List, Tuple, Union
 
 from google.cloud import storage
+from google.api_core import exceptions as gax_exceptions
+from google.api_core.retry import Retry
 
 _client = None
+
+# GCS occasionally returns a 504/503/429 on an individual request under load
+# (seen in practice as a GatewayTimeout on one copy_blob call out of thousands
+# during a large flatten-to-staging run), with nothing wrong with the objects
+# involved -- just retrying the same call succeeds. This wraps the handful of
+# per-object calls this CLI makes many times in a loop (copy_blob, and the
+# single-object reads/writes other functions below use) so one flaky response
+# doesn't abort an hours-long run. google-cloud-storage's own transport-level
+# retries don't cover this: a copy between buckets/projects isn't always
+# treated as idempotent by the client library's defaults.
+_TRANSIENT_GCS_ERRORS = (
+    gax_exceptions.GatewayTimeout,
+    gax_exceptions.ServiceUnavailable,
+    gax_exceptions.TooManyRequests,
+    gax_exceptions.InternalServerError,
+)
+
+
+def _log_retry(exc: Exception) -> None:
+    print(f"[gcs] transient error, retrying: {exc!r}", flush=True)
+
+
+_transient_retry = Retry(
+    predicate=lambda exc: isinstance(exc, _TRANSIENT_GCS_ERRORS),
+    initial=2.0,
+    maximum=30.0,
+    multiplier=2.0,
+    deadline=180.0,
+    on_error=_log_retry,
+)
 
 
 def _get_client() -> storage.Client:
@@ -59,15 +91,7 @@ def upload_file(local_path: str, gs_uri: str) -> str:
     return gs_uri
 
 
-def copy_blob(source_uri: str, dest_uri: str) -> str:
-    """Server-side copy of one GCS object to another location -- no data
-    is downloaded or re-uploaded, so this is fast and has no egress cost,
-    even across buckets. Used by `input_staging.py` to flatten a
-    multi-folder input list into one folder before a run is triggered, as
-    a client-side workaround for the inference wrapper's folder-mixing
-    bug (see survey_sampler.py's module docstring for the confirmed root
-    cause).
-    """
+def _copy_blob_once(source_uri: str, dest_uri: str) -> str:
     src_bucket_name, src_blob_path = _split_uri(source_uri)
     dest_bucket_name, dest_blob_path = _split_uri(dest_uri)
     client = _get_client()
@@ -76,6 +100,19 @@ def copy_blob(source_uri: str, dest_uri: str) -> str:
     dest_bucket = client.bucket(dest_bucket_name)
     src_bucket.copy_blob(src_blob, dest_bucket, dest_blob_path)
     return dest_uri
+
+
+def copy_blob(source_uri: str, dest_uri: str) -> str:
+    """Server-side copy of one GCS object to another location -- no data
+    is downloaded or re-uploaded, so this is fast and has no egress cost,
+    even across buckets. Used by `input_staging.py` to flatten a
+    multi-folder input list into one folder before a run is triggered, as
+    a client-side workaround for the inference wrapper's folder-mixing
+    bug (see survey_sampler.py's module docstring for the confirmed root
+    cause). Retries a transient 5xx/429 from GCS (see _transient_retry above)
+    instead of letting one flaky response abort the whole batch.
+    """
+    return _transient_retry(_copy_blob_once)(source_uri, dest_uri)
 
 
 def list_prefix_with_sizes(gs_uri_prefix: str) -> List[Tuple[str, int]]:

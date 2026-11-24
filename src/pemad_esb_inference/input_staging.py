@@ -87,10 +87,17 @@ def flatten_to_staging(
     plan = plan_flat_names(paths)
     dest_uris = [f"{prefix}{dest_name}" for _source, dest_name in plan]
 
+    total = len(paths)
+    done = 0
+
     def _copy_one(pair: Tuple[str, str]) -> str:
+        nonlocal done
         source_uri, dest_uri = pair
-        gcs.copy_blob(source_uri, dest_uri)
-        return dest_uri
+        result = gcs.copy_blob(source_uri, dest_uri)  # retries transient GCS errors itself
+        done += 1
+        if done % 500 == 0 or done == total:
+            print(f"[flatten-to-staging] copied {done}/{total}", flush=True)
+        return result
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # list()/map() preserves input order in its output, so dest_uris
